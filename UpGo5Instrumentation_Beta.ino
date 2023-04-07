@@ -43,6 +43,7 @@
 // sent via bluetooth. Launch event is now determined by looking at the vertical axis accelerometer.
 // Discontinued the use of the RTC for periodic interrupts. Now using TC3.
 // Discontinued using TCs for 32 bit millisecond counter. Now using millis() function
+// Added parachute release function
 
 // ==============================  Include Files  ==================================
 #include <SPI.h>                      // Sensor and micro SD card communication
