@@ -43,8 +43,6 @@
 // sent via bluetooth. Launch event is now determined by looking at the vertical axis accelerometer.
 // Discontinued the use of the RTC for periodic interrupts. Now using TC3.
 // Discontinued using TCs for 32 bit millisecond counter. Now using millis() function
-// Added parachute release function
-// Move project to github
 
 // ==============================  Include Files  ==================================
 #include <SPI.h>                      // Sensor and micro SD card communication
@@ -60,7 +58,7 @@
 // ===============================  Constants  =====================================
 #define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
-const String VERSION = "Beta 5.02";
+const String VERSION = "Beta 5.03";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -731,8 +729,19 @@ timeOutCounter++;
 // The application cannot exit the post flight state.
 // ==========================================================================
 void postFlightStateLoop() {
+  static bool sent = false;
   flashLED(LED_PPS_POST_FLIGHT);
-  
+  if (bleRadio.isConnected() && sent != true) {
+    delay(5000);
+    bleRadio.print("AT+BLEUARTTX=");
+    bleRadio.print("Max Alt: ");
+    bleRadio.println(maxAltitude);
+    
+    bleRadio.print("AT+BLEUARTTX=");
+    bleRadio.print("Max Accel: ");
+    bleRadio.println(maxAcceleration);
+    sent = true;
+  }
 }
 
 
