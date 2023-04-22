@@ -58,7 +58,7 @@
 // ===============================  Constants  =====================================
 #define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
-const String VERSION = "Beta 5.03";
+const String VERSION = "Beta 5.04";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -740,8 +740,26 @@ void postFlightStateLoop() {
     bleRadio.print("AT+BLEUARTTX=");
     bleRadio.print("Max Accel: ");
     bleRadio.println(maxAcceleration);
+
+    bleRadio.print("AT+BLEUARTTX=");
+    bleRadio.println("Launch Again?");
+
+    
     sent = true;
   }
+  bleRadio.println("AT+BLEUARTRX");
+    bleRadio.readline();
+    if (!strcmp(bleRadio.buffer, "OK") == 0) {
+      // Some data was received
+      String launchAgain = bleRadio.buffer;
+      launchAgain.toLowerCase();
+      if (strcmp(launchAgain.c_str(), "yes") == 0) {
+        // Launch again command received
+        state = READY;
+        bleRadio.println("AT+BLEUARTTX=READY");
+        logActivity("EVENT", "READY");
+      }
+    }
 }
 
 
