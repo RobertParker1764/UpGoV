@@ -58,7 +58,7 @@
 // ===============================  Constants  =====================================
 #define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
-const String VERSION = "Beta 5.04";
+const String VERSION = "Beta 5.08";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -84,11 +84,11 @@ const float SEALEVELPRESSURE = 1013.25;     // Sea level pressure in hpa
 const float METERS_TO_FEET = 3.28084;       // Conversion from meters to feet
 const long LOG_FILE_DURATION = 10;          // How long sensor data is logged to the log file in seconds
 const float BAT_VOLT_LOW = 3.65;            // LiPo battery voltage below this level is at low charge
-const uint16_t BAT_MEAS_PER  = 6000;       // LiPo battery voltage measurement period (ms)
+const uint16_t BAT_MEAS_PER  = 60000;       // LiPo battery voltage measurement period (ms)
 const float NO_MOTION_UPPER = 0.1;          // Rate below which we are not moving
 const float NO_MOTION_LOWER = -0.1;         // Rate above which we are not moving
 const uint16_t TIME_OUT = 30;               // Number of seconds after which we will assume we have landed.
-const float LAUNCH_ACCEL = 1.1;             // Threshold for launch determination in G's
+const float LAUNCH_ACCEL = 1.2;             // Threshold for launch determination in G's
 const uint16_t PARACHUTE_SIGNAL_DURATION = 2000;  // Duration of parachute release signal in milliseconds
 
 enum states {START_UP, FAULT, READY, ARMED, LOGGING, POST_FLIGHT};
@@ -176,7 +176,8 @@ void setup() {
 
   delay(10000);
 
-  bleRadio.println("AT+BLUEARTTX=Initializing");
+  bleRadio.println("AT+BLEUARTTX=Initializing");
+
 
 #ifdef DEBUG
   Serial.println(F("Bluetooth link connected"));
@@ -496,8 +497,9 @@ void readyStateLoop() {
     // Some data was received
     String message = bleRadio.buffer;
     message.toLowerCase();
-    if (strcmp(message.c_str(), "arm") == 0 && accelerometer_gyro.getXAxisAccel() > 0.9) {
-      // Arm command received
+    if (strcmp(message.c_str(), "arm") == 0) {
+      if (accelerometer_gyro.getXAxisAccel() > 0.9) {
+        // Arm command received
       state = ARMED;
       bleRadio.println("AT+BLEUARTTX=ARMED");
       logActivity("EVENT", "Armed");
@@ -529,7 +531,13 @@ void readyStateLoop() {
         Serial.println("SD card write error");
 #endif
       }
-    } // End arm command processing
+      
+      } else {
+        bleRadio.println("AT+BLEUARTTX=Rocket must be upright to arm");
+      }
+    } else {
+      bleRadio.println("AT+BLEUARTTX=Expected arm command");
+    }
   }
 
   // Check battery voltage and report via bluetooth radio
