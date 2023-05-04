@@ -58,7 +58,7 @@
 // ===============================  Constants  =====================================
 #define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
-const String VERSION = "Beta 5.08";
+const String VERSION = "Beta 5.10";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -118,8 +118,8 @@ float lipoBatteryVoltage = 0;   // Battery voltage of LiPo battery as measured b
 states state = START_UP;        // The current state
 errors error = NONE;            // Error
 float maxAcceleration = 0;      // The maximum axial acceleration measured during flight
-float maxAltitude = 0;          // The maximum altitude measured during flight
-
+float maxAltitude = 0; // The maximum altitude measured during flight
+uint32_t flightLength = 0;
 
 // =======================  TC3 Interrupt Handler  ===================================
 // TC3 will generate an interrupt at a rate determined by TC3_INT_PERIOD to drive the 
@@ -350,8 +350,8 @@ void setup() {
   // Configure accelerometer/gyro settings
   accelerometer_gyro.setAccelRange(LSM6DSO32_RANGE_32G);
   accelerometer_gyro.setGyroRange(LSM6DSO32_RANGE_500DPS);
-  accelerometer_gyro.setAccelDataRate(LSM6DSO32_ACCEL_52_HZ);
-  accelerometer_gyro.setGyroDataRate(LSM6DSO32_GYRO_52_HZ);
+  accelerometer_gyro.setAccelDataRate(LSM6DSO32_ACCEL_104_HZ);
+  accelerometer_gyro.setGyroDataRate(LSM6DSO32_GYRO_104_HZ);
 
   logActivity("STATUS", "Accelerometer/gyro sensor initialized");
 
@@ -684,38 +684,12 @@ timeOutCounter++;
           (accelerometer_gyro.getYAxisRate() > NO_MOTION_LOWER) &&
           (accelerometer_gyro.getZAxisRate() < NO_MOTION_UPPER) && 
           (accelerometer_gyro.getZAxisRate() > NO_MOTION_LOWER)) {
-            state = POST_FLIGHT;
-            if (dataFileOpen) {
-              closeDataFile();
-            }
-            logActivity("EVENT", "Landed");
-            // Log the maximum acceleration and altitude
-            String logString = "Maximum acceleration = ";
-            logString += maxAcceleration;
-            logString += " Gs";
-            logActivity("STATUS", logString);
-            logString = "Maximum altitude = ";
-            logString += maxAltitude;
-            logString += " ft";
-            logActivity("STATUS", logString);
+            postFlightDataLog("LANDED");
           }
 
         // Check for timeout
         if (timeOutCounter * TC3_INT_PERIOD > TIME_OUT * 1000) {
-          state = POST_FLIGHT;
-          if (dataFileOpen) {
-            closeDataFile();
-          }
-          logActivity("EVENT", "Landed");
-          // Log the maximum acceleration and altitude
-          String logString = "Maximum acceleration = ";
-          logString += maxAcceleration;
-          logString += " Gs";
-          logActivity("STATUS", logString);
-          logString = "Maximum altitude = ";
-          logString += maxAltitude;
-          logString += " ft";
-          logActivity("STATUS", logString);
+          postFlightDataLog("TIMEOUT");
         }
 
     // Checks if we need to turn off the parachute release signal
@@ -750,6 +724,10 @@ void postFlightStateLoop() {
     bleRadio.println(maxAcceleration);
 
     bleRadio.print("AT+BLEUARTTX=");
+    bleRadio.print("Flight Length: ");
+    bleRadio.println(flightLength);
+
+    bleRadio.print("AT+BLEUARTTX=");
     bleRadio.println("Launch Again?");
 
     
@@ -766,6 +744,7 @@ void postFlightStateLoop() {
         state = READY;
         bleRadio.println("AT+BLEUARTTX=READY");
         logActivity("EVENT", "READY");
+        sent = false;
       }
     }
 }
@@ -1079,3 +1058,31 @@ uint8_t computeLaunchPointAlt() {
 
   return altimeterErrorCode;
 }
+
+// ==================== postFlightDataLog =========================
+// Prints to the SD card max altitude, max acceleration, and flight
+// duration after timeout\landing.
+// ====================================================================
+ void postFlightDataLog(String flightEndCause) {
+  state = POST_FLIGHT;
+  if (dataFileOpen) {
+    closeDataFile();
+  }
+  logActivity("EVENT", flightEndCause);
+  // Log the maximum acceleration and altitude
+  uint32_t landTime = millis();
+  uint32_t flightLength = landTime - launchTime;
+  flightLength /= 1000;
+  String logString = "Maximum acceleration = ";
+  logString += maxAcceleration;
+  logString += " Gs";
+  logActivity("STATUS", logString);
+  logString = "Maximum altitude = ";
+  logString += maxAltitude;
+  logString += " ft";
+  logActivity("STATUS", logString);
+  logString = "FLight duration = ";
+  logString += flightLength;
+  logString += "sec";
+  logActivity("STATUS", logString);
+ }
