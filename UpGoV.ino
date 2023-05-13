@@ -58,7 +58,7 @@
 // ===============================  Constants  =====================================
 #define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
-const String VERSION = "Beta 5.10";
+const String VERSION = "Beta 5.11";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -90,6 +90,7 @@ const float NO_MOTION_LOWER = -0.1;         // Rate above which we are not movin
 const uint16_t TIME_OUT = 30;               // Number of seconds after which we will assume we have landed.
 const float LAUNCH_ACCEL = 1.2;             // Threshold for launch determination in G's
 const uint16_t PARACHUTE_SIGNAL_DURATION = 2000;  // Duration of parachute release signal in milliseconds
+const float GRAVITY_ACC = 32.174;          // The acceleration on the surface of the Earth in f/sec2
 
 enum states {START_UP, FAULT, READY, ARMED, LOGGING, POST_FLIGHT};
 enum errors {NONE, GYRO, ACCEL, ALT, BATTERY};
@@ -120,6 +121,8 @@ errors error = NONE;            // Error
 float maxAcceleration = 0;      // The maximum axial acceleration measured during flight
 float maxAltitude = 0; // The maximum altitude measured during flight
 uint32_t flightLength = 0;
+float velocity = 0;
+float maxVelocity = 0;
 
 // =======================  TC3 Interrupt Handler  ===================================
 // TC3 will generate an interrupt at a rate determined by TC3_INT_PERIOD to drive the 
@@ -518,7 +521,7 @@ void readyStateLoop() {
       // Write the header row to the log file with labels for the data
       // File name to include the date from the Real Time Clock
       // Leave the file open. It will be closed later after all data is logged
-      String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), X_Accel(Gs), Y_Accel(Gs), Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps)";
+      String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), X_Accel(Gs), Y_Accel(Gs), Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
       openDataFile();
       // Write the header string to the data file
       if (dataFile) {
@@ -663,6 +666,12 @@ timeOutCounter++;
   // Read the accelerometer/gyro sensor data
   accelerometer_gyro.readSensorData();
 
+  // Compute velocity
+  velocity = velocityCalculator(timeInMS, accelerometer_gyro.getXAxisAccel() - 1);
+  if (velocity > maxVelocity) {
+    maxVelocity = velocity;
+  }
+
   // Update maximum readings
   if (accelerometer_gyro.getXAxisAccel() > maxAcceleration) {
     maxAcceleration = accelerometer_gyro.getXAxisAccel();
@@ -690,6 +699,7 @@ timeOutCounter++;
         // Check for timeout
         if (timeOutCounter * TC3_INT_PERIOD > TIME_OUT * 1000) {
           postFlightDataLog("TIMEOUT");
+          timeOutCounter = 0;
         }
 
     // Checks if we need to turn off the parachute release signal
@@ -724,6 +734,10 @@ void postFlightStateLoop() {
     bleRadio.println(maxAcceleration);
 
     bleRadio.print("AT+BLEUARTTX=");
+    bleRadio.print("Max Velocity: ");
+    bleRadio.println(maxVelocity);
+
+    bleRadio.print("AT+BLEUARTTX=");
     bleRadio.print("Flight Length: ");
     bleRadio.println(flightLength);
 
@@ -742,6 +756,10 @@ void postFlightStateLoop() {
       if (strcmp(launchAgain.c_str(), "yes") == 0) {
         // Launch again command received
         state = READY;
+        maxAltitude = 0;
+        maxAcceleration = 0;
+        maxVelocity = 0;
+        flightLength = 0;
         bleRadio.println("AT+BLEUARTTX=READY");
         logActivity("EVENT", "READY");
         sent = false;
@@ -838,6 +856,8 @@ void logData(uint32_t time) {
   logData += accelerometer_gyro.getYAxisRate();
   logData += ",";
   logData += accelerometer_gyro.getZAxisRate();
+  logData += ",";
+  logData += velocity;
   logData += "\n";
 
   // Write the log data to the SD card
@@ -1085,4 +1105,35 @@ uint8_t computeLaunchPointAlt() {
   logString += flightLength;
   logString += "sec";
   logActivity("STATUS", logString);
+  logString = "Maximum velocity = ";
+  logString += maxVelocity;
+  logString += " fps";
+  logActivity("STATUS", logString);
  }
+
+// ==================== velocityCalculator =========================
+// Calculates the rocket's velocity.
+// ====================================================================
+float velocityCalculator(uint32_t currentTime, float currentAcc) {
+ static float prevTime = 0;
+ static float prevAcc = 0; // f/sec2
+ static float prevVelocity = 0;
+
+ float  scaledAcc = currentAcc * GRAVITY_ACC; // Acceleration to f/sec2
+
+ float avgAcc = (prevAcc + scaledAcc) / 2;
+
+ float timeIntr = currentTime - prevTime;
+
+ timeIntr /= 1000; // TimeIntr in sec
+
+ float deltaV = avgAcc * timeIntr; // f/sec
+
+ float velocity = deltaV + prevVelocity; // f/sec
+
+ prevTime = currentTime;
+ prevAcc = scaledAcc;
+ prevVelocity = velocity;
+ 
+ return velocity;
+}
