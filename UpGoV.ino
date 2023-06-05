@@ -58,7 +58,7 @@
 // ===============================  Constants  =====================================
 #define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
-const String VERSION = "Beta 5.11";
+const String VERSION = "Beta 5.12";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -73,24 +73,23 @@ const uint8_t SENSOR_SPI_MOSI = 10;
 const uint8_t SENSOR_SPI_MISO = 11;
 const uint8_t BATTERY_MONITOR = 9;
 const uint8_t PARACHUTE_RELEASE = A4;
-
 // Other Constants
 const uint8_t TC3_INT_PERIOD = 10;          // RTC interrupt period in milliseconds
 const uint16_t LED_PPS_FAULT = 100;          // LED pulse rate while in FAULT state
 const uint16_t LED_PPS_ARMED = 200;          // LED pulse rate while in ARMED state
 const uint16_t LED_PPS_POST_FLIGHT = 10000;  // LED pulse period (ms) in POST_FLIGHT state
 const int LED_PULSE_WIDTH = 50;             // LED pulse width in all states
-const float SEALEVELPRESSURE = 1013.25;     // Sea level pressure in hpa
-const float METERS_TO_FEET = 3.28084;       // Conversion from meters to feet
+const double SEALEVELPRESSURE = 1013.25;     // Sea level pressure in hpa
+const double METERS_TO_FEET = 3.28084;       // Conversion from meters to feet
 const long LOG_FILE_DURATION = 10;          // How long sensor data is logged to the log file in seconds
-const float BAT_VOLT_LOW = 3.65;            // LiPo battery voltage below this level is at low charge
+const double BAT_VOLT_LOW = 3.65;            // LiPo battery voltage below this level is at low charge
 const uint16_t BAT_MEAS_PER  = 60000;       // LiPo battery voltage measurement period (ms)
-const float NO_MOTION_UPPER = 0.1;          // Rate below which we are not moving
-const float NO_MOTION_LOWER = -0.1;         // Rate above which we are not moving
+const double NO_MOTION_UPPER = 0.1;          // Rate below which we are not moving
+const double NO_MOTION_LOWER = -0.1;         // Rate above which we are not moving
 const uint16_t TIME_OUT = 30;               // Number of seconds after which we will assume we have landed.
-const float LAUNCH_ACCEL = 1.2;             // Threshold for launch determination in G's
+const double LAUNCH_ACCEL = 0.2;             // Threshold for launch determination in G's
 const uint16_t PARACHUTE_SIGNAL_DURATION = 2000;  // Duration of parachute release signal in milliseconds
-const float GRAVITY_ACC = 32.174;          // The acceleration on the surface of the Earth in f/sec2
+const double GRAVITY_ACC = 32.174;          // The acceleration on the surface of the Earth in f/sec2
 
 enum states {START_UP, FAULT, READY, ARMED, LOGGING, POST_FLIGHT};
 enum errors {NONE, GYRO, ACCEL, ALT, BATTERY};
@@ -107,22 +106,27 @@ Adafruit_BluefruitLE_SPI bleRadio(BLUEFRUIT_SPI_CS, BLUEFRUIT_SPI_IRQ, BLUEFRUIT
 
 double temperature = 0.0;       // Temperature in degrees C
 double pressure = 0.0;          // Pressure in hpa
-float altitude = 0.0;           // Altitude in meters
-float baseAltitude = 0.0;       // The altitude of the rocket launch pad
+double altitude = 0.0;           // Altitude in meters
+double baseAltitude = 0.0;       // The altitude of the rocket launch pad
 int8_t altimeterErrorCode = 0;  // Result code returned from BMP390 API calls
 bool readyForLaunch = false;
 bool dataFileOpen = false;
 File dataFile;                  // The data file object
 File logFile;                   // The log file object
 uint32_t launchTime = 0;        // Time at launch in millisends
-float lipoBatteryVoltage = 0;   // Battery voltage of LiPo battery as measured by ADC
+double lipoBatteryVoltage = 0;   // Battery voltage of LiPo battery as measured by ADC
 states state = START_UP;        // The current state
 errors error = NONE;            // Error
-float maxAcceleration = 0;      // The maximum axial acceleration measured during flight
-float maxAltitude = 0; // The maximum altitude measured during flight
+double maxAcceleration = 0;      // The maximum axial acceleration measured during flight
+double maxAltitude = 0; // The maximum altitude measured during flight
 uint32_t flightLength = 0;
-float velocity = 0;
-float maxVelocity = 0;
+double velocity = 0;
+double maxVelocity = 0;
+double earthAccelerationMeasAvg = 1.0;  // Average measured earth acceleration
+// Global vars used by the velocityCaculator() function
+uint32_t prevTime = 0;
+double prevAcc = 0.0; // f/sec2
+double prevVelocity = 0;
 
 // =======================  TC3 Interrupt Handler  ===================================
 // TC3 will generate an interrupt at a rate determined by TC3_INT_PERIOD to drive the 
@@ -581,6 +585,10 @@ void readyStateLoop() {
 //      of sensor readings before transitioning to the logging state.
 // ==========================================================================
 void armedStateLoop() {
+  // Compute a running average of the measured earth acceleration
+  // from the last 5 x-axis acceleration measurements
+  computeAverageAcceleration();
+  
   // Check for a DISARM event every time through the loop
   bleRadio.println("AT+BLEUARTRX");
   bleRadio.readline();
@@ -667,7 +675,7 @@ timeOutCounter++;
   accelerometer_gyro.readSensorData();
 
   // Compute velocity
-  velocity = velocityCalculator(timeInMS, accelerometer_gyro.getXAxisAccel() - 1);
+  velocity = velocityCalculator(timeInMS, accelerometer_gyro.getXAxisAccel() - earthAccelerationMeasAvg);
   if (velocity > maxVelocity) {
     maxVelocity = velocity;
   }
@@ -760,6 +768,9 @@ void postFlightStateLoop() {
         maxAcceleration = 0;
         maxVelocity = 0;
         flightLength = 0;
+        prevTime = 0;
+        prevAcc = 0.0; // f/sec2
+        prevVelocity = 0;
         bleRadio.println("AT+BLEUARTTX=READY");
         logActivity("EVENT", "READY");
         sent = false;
@@ -936,9 +947,9 @@ void closeDataFile() {
 // ======================== readBatteryVoltage ==============================
 // Reads and returns the LiPo battery voltage. The value returned is in volts
 // ==========================================================================
-float readBatteryVoltage(void) {
+double readBatteryVoltage(void) {
   int batteryVolt = analogRead(BATTERY_MONITOR);
-  return ((float)(batteryVolt * 4.096) / 4096.0); // measurement in volts
+  return ((batteryVolt * 4.096) / 4096.0); // measurement in volts
 }
 
 // ======================= displayBatteryLevel ==============================
@@ -1049,7 +1060,7 @@ bool isLaunched() {
   // Read the accelerometer/gyro sensor data
   accelerometer_gyro.readAccelData();
   // Check if acceleration measurement exceeds launch threshold
-  if (accelerometer_gyro.getXAxisAccel() > LAUNCH_ACCEL) {
+  if ((accelerometer_gyro.getXAxisAccel() - earthAccelerationMeasAvg) > LAUNCH_ACCEL) {
     
     return true;
 
@@ -1114,26 +1125,66 @@ uint8_t computeLaunchPointAlt() {
 // ==================== velocityCalculator =========================
 // Calculates the rocket's velocity.
 // ====================================================================
-float velocityCalculator(uint32_t currentTime, float currentAcc) {
- static float prevTime = 0;
- static float prevAcc = 0; // f/sec2
- static float prevVelocity = 0;
+double velocityCalculator(uint32_t currentTime, double currentAcc) {
+ 
+ double timeInterval = 0.0;
 
- float  scaledAcc = currentAcc * GRAVITY_ACC; // Acceleration to f/sec2
+ double  scaledAcc = currentAcc * GRAVITY_ACC; // Acceleration to f/sec2
 
- float avgAcc = (prevAcc + scaledAcc) / 2;
+ double avgAcc = (prevAcc + scaledAcc) / 2;
 
- float timeIntr = currentTime - prevTime;
+ if (prevTime == 0) {
+  timeInterval = (double)TC3_INT_PERIOD;
+ } else {
+  timeInterval = (double)currentTime - (double)prevTime;
+ }
+ 
 
- timeIntr /= 1000; // TimeIntr in sec
+ timeInterval /= 1000.0; // TimeInterval in sec
 
- float deltaV = avgAcc * timeIntr; // f/sec
+ double deltaV = avgAcc * timeInterval; // f/sec
 
- float velocity = deltaV + prevVelocity; // f/sec
+ double velocity = deltaV + prevVelocity; // f/sec
 
  prevTime = currentTime;
  prevAcc = scaledAcc;
  prevVelocity = velocity;
  
  return velocity;
+
+ 
+}
+
+// ==================== computeAverageAcceleration ===================
+// Calculates the running average of the measured acceleration over
+// 5 samples. Used to compute the average earth acceleration prior to 
+// launch.
+// ===================================================================
+void computeAverageAcceleration() {
+  // Array to hold the ten acceleration measurements
+  static double accelMeasurements[10] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+  static int accelMeasIndex = 0;  // Next measurement to be saved
+
+  if (accelMeasIndex < 10) {
+    // Read the accelerometer/gyro sensor data...
+    accelerometer_gyro.readSensorData();
+    // ... and save the latest measurement
+    accelMeasurements[accelMeasIndex] = accelerometer_gyro.getXAxisAccel();
+
+    ++accelMeasIndex;
+
+    // Compute the average acceleration
+    double accelSum = 0;
+    for (int index = 0; index < 10; ++index) {
+      accelSum += accelMeasurements[index];
+    }
+
+  // Save the result to the global variable
+  earthAccelerationMeasAvg = accelSum / 10.0;
+
+  Serial.print("Average Earth Accel: ");
+  Serial.println(earthAccelerationMeasAvg);
+  }
+
+  
 }
