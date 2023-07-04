@@ -1,4 +1,4 @@
-// UpGoer5Instrumentation
+ // UpGoer5Instrumentation
 // Version: Beta5
 // Author: Bob Parker
 // Date: 2/22/2023
@@ -56,7 +56,7 @@
 
 
 // ===============================  Constants  =====================================
-#define DEBUG // Uncomment to enable debug comments printed to the console
+//#define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
 const String VERSION = "Beta 5.12";
 
@@ -84,8 +84,8 @@ const double METERS_TO_FEET = 3.28084;       // Conversion from meters to feet
 const long LOG_FILE_DURATION = 10;          // How long sensor data is logged to the log file in seconds
 const double BAT_VOLT_LOW = 3.65;            // LiPo battery voltage below this level is at low charge
 const uint16_t BAT_MEAS_PER  = 60000;       // LiPo battery voltage measurement period (ms)
-const double NO_MOTION_UPPER = 0.1;          // Rate below which we are not moving
-const double NO_MOTION_LOWER = -0.1;         // Rate above which we are not moving
+const double NO_MOTION_UPPER = 2.0;          // Rate below which we are not moving
+const double NO_MOTION_LOWER = -2.0;         // Rate above which we are not moving
 const uint16_t TIME_OUT = 30;               // Number of seconds after which we will assume we have landed.
 const double LAUNCH_ACCEL = 0.2;             // Threshold for launch determination in G's
 const uint16_t PARACHUTE_SIGNAL_DURATION = 2000;  // Duration of parachute release signal in milliseconds
@@ -380,7 +380,7 @@ void setup() {
     bleRadio.println("AT+BLEUARTTX=Altimeter initialization error");
   } else {
 #ifdef DEBUG
-    Serial.println("Accelerometer/Gyro sensor intiailaized");
+    Serial.println("Altimeter sensor initialized");
 #endif
   }
   
