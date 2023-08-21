@@ -1,7 +1,7 @@
  // UpGoer5Instrumentation
-// Version: Beta5
+// Version: Beta 6
 // Author: Bob Parker
-// Date: 2/22/2023
+// Date: 7/4/2023
 // Tested: 
 //
 // Code for a model rocket instrumentation package. Measures and logs acceleration and turning
@@ -9,7 +9,7 @@
 // ground. Measures and logs air temperature.
 // In the loop function, getting new sensor readings and logging them to the SD card is taking
 // between 15ms and 18ms. When logging is turned off then getting the sensor readings is taking
-// about 850usec. TODO: Make new timing measurements for the SAMD21 chip
+// about 850usec.
 
 // Uses an SD card to write two files:
 // eventFile.txt: Contains log of events including battery voltage, errors, state transitions, etc.
@@ -44,6 +44,9 @@
 // Discontinued the use of the RTC for periodic interrupts. Now using TC3.
 // Discontinued using TCs for 32 bit millisecond counter. Now using millis() function
 
+// Beta 6:
+// Added integration with IOS UpGoV app.
+
 // ==============================  Include Files  ==================================
 #include <SPI.h>                      // Sensor and micro SD card communication
 #include <SD.h>                       // SD card library functions
@@ -58,7 +61,7 @@
 // ===============================  Constants  =====================================
 //#define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
-const String VERSION = "Beta 5.12";
+const String VERSION = "Beta 6.01";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -82,8 +85,10 @@ const int LED_PULSE_WIDTH = 50;             // LED pulse width in all states
 const double SEALEVELPRESSURE = 1013.25;     // Sea level pressure in hpa
 const double METERS_TO_FEET = 3.28084;       // Conversion from meters to feet
 const long LOG_FILE_DURATION = 10;          // How long sensor data is logged to the log file in seconds
-const double BAT_VOLT_LOW = 3.65;            // LiPo battery voltage below this level is at low charge
-const uint16_t BAT_MEAS_PER  = 60000;       // LiPo battery voltage measurement period (ms)
+const double BAT_VOLT_LOW = 3.5;            // LiPo battery voltage below this level is at low charge
+const double BAT_VOLT_FULL = 4.1;
+const double BAT_VOLT_OK = 3.7;
+const uint16_t BAT_MEAS_PER  = 10000;       // LiPo battery voltage measurement period (ms)
 const double NO_MOTION_UPPER = 2.0;          // Rate below which we are not moving
 const double NO_MOTION_LOWER = -2.0;         // Rate above which we are not moving
 const uint16_t TIME_OUT = 30;               // Number of seconds after which we will assume we have landed.
@@ -181,9 +186,10 @@ void setup() {
     delay(500);
   }
 
-  delay(10000);
+  delay(1000);
 
-  bleRadio.println("AT+BLEUARTTX=Initializing");
+  bleRadio.println("AT+BLEUARTTX=ST:INITIALIZING");
+  delay(20);
 
 
 #ifdef DEBUG
@@ -197,6 +203,8 @@ void setup() {
   PORT->Group[0].OUTCLR.reg = PORT_PA17; // Turn off the on-board LED
   pinMode(PARACHUTE_RELEASE, OUTPUT);
   digitalWrite(PARACHUTE_RELEASE, LOW);
+  bleRadio.println("AT+BLEUARTTX=MS:Port Pins Init");
+  delay(20);
 
   // ======================  Initialize the Sensor SPI Bus  ============================
   sensorSPI.begin();
@@ -206,6 +214,8 @@ void setup() {
   pinPeripheral(10, PIO_SERCOM);
   pinPeripheral(11, PIO_SERCOM);
   pinPeripheral(12, PIO_SERCOM);
+  bleRadio.println("AT+BLEUARTTX=MS:Sensor SPI Init");
+  delay(20);
 
   // ============================ SD Card Library Setup ================================
   
@@ -213,13 +223,17 @@ void setup() {
 #ifdef DEBUG
     Serial.println("SD card failed to initialize");
 #endif
-    bleRadio.println("AT+BLEUARTTX=SD card initilization failure");
+    bleRadio.println("AT+BLEUARTTX=ER:SD Card Init");
+    delay(20);
+    bleRadio.println("AT+BLEUARTTX=ST:ERROR");
+    delay(20);
     while(1); // Hang here
   } else {
 #ifdef DEBUG
     Serial.println("SD card initialized");
 #endif
-    bleRadio.println("AT+BLEUARTTX=SD card initialized");
+    bleRadio.println("AT+BLEUARTTX=MS:SD Card Init");
+    delay(20);
   }
 
   // ======================  SAMD21 Generic Clock Setup  ====================
@@ -241,6 +255,8 @@ void setup() {
 #ifdef DEBUG
   Serial.println("Generic clock initialized");
 #endif
+  bleRadio.println("AT+BLEUARTTX=MS:GCLK 6 Init");
+  delay(20);
 
   // =============================  TC3 Setup  ==============================
   // TC3 is used to generate a periodic interrupt to drive all activity.
@@ -277,6 +293,9 @@ void setup() {
   Serial.println("TC3 initialized");
 #endif
 
+  bleRadio.println("AT+BLEUARTTX=MS:TC3 Init");
+  delay(20);
+
   // =============================== ADC Setup ==========================
   // The ADC is used to measure the LiPo battery voltage level
   // The ADC is configured to use an external 2.048V reference
@@ -293,7 +312,8 @@ void setup() {
   Serial.println("ADC initialized");
 #endif
 
-
+  bleRadio.println("AT+BLEUARTTX=MS:ADC Init");
+  delay(20);
 
   // ======================== Real Time Clock Setup =====================
   // The Real Time Clock on the Adalogger Feather Wing is used to create
@@ -304,7 +324,8 @@ void setup() {
 #ifdef DEBUG
     Serial.println("Real Time Clock not found");
 #endif
-    bleRadio.println("AT+BLEUARTTX=Real Time Clock not found");
+    bleRadio.println("AT+BLEUARTTX=ER:RTC");
+    bleRadio.println("AT+BLEUARTTX=ST:ERROR");
     state = FAULT;
     logActivity("ERROR", "Real Time Clock not found");
   }
@@ -322,7 +343,8 @@ void setup() {
   // Start the Real Time Clock
   realTimeClock.start();
   logActivity("STATUS", "Real Time Clock started");
-  bleRadio.println("AT+BLEUARTTX=Real Time Clock started");
+  bleRadio.println("AT+BLEUARTTX=MS:RTC Init");
+  delay(20);
 
 #ifdef DEBUG
   Serial.println("Real time clock initialized");
@@ -346,9 +368,11 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the accelerometer/gyro sensor");
-    bleRadio.println("AT+BLEUARTTX=Inertial sensor initialization error");
+    bleRadio.println("AT+BLEUARTTX=ER:LSM6DS032 Error");
+    delay(20);
   } else {
-    bleRadio.println("AT+BLEUARTTX=Inertial sensors initialized");
+    bleRadio.println("AT+BLEUARTTX=MS:LSM6DS032 Init");
+    delay(20);
 #ifdef DEBUG
     Serial.println("Accelerometer/Gyro sensor initilaized");
 #endif
@@ -377,7 +401,7 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the altimeter sensor");
-    bleRadio.println("AT+BLEUARTTX=Altimeter initialization error");
+    bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
   } else {
 #ifdef DEBUG
     Serial.println("Altimeter sensor initialized");
@@ -404,6 +428,9 @@ void setup() {
     printAltimeterError("Error writing altimeter settings:", altimeterErrorCode);
 #endif
     logActivity("ERROR", "Error writing altimeter settings");
+    bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
+    delay(20);
+    state = FAULT;
   }
 
   // Set the power mode to Normal. It will start taking measurement now.
@@ -418,10 +445,14 @@ void setup() {
     printAltimeterError("Error writing altimeter power mode:", altimeterErrorCode);
 #endif
     logActivity("ERROR", "Error writing altimeter power mode");
+    bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
+    delay(20);
+    state = FAULT;
   }
 
   logActivity("STATUS", "Altimeter settings and power mode initialized");
-  bleRadio.println(F("AT+BLEUARTTX=Altimeter sensor initialized"));
+  bleRadio.println(F("AT+BLEUARTTX=MS:BMP390 Init"));
+  delay(20);
   
 
   // ======================= Ready State Check ===========================
@@ -430,7 +461,7 @@ void setup() {
   if (state != FAULT) {
     state = READY;
     logActivity("EVENT", "Transition to Ready state");
-    bleRadio.println(F("AT+BLEUARTTX=READY - Not Armed"));
+    bleRadio.println(F("AT+BLEUARTTX=ST:READY"));
   }
 
   // Enable TC3. We will start getting TC3 interrupts at the TC3_INT_PERIOD
@@ -508,7 +539,7 @@ void readyStateLoop() {
       if (accelerometer_gyro.getXAxisAccel() > 0.9) {
         // Arm command received
       state = ARMED;
-      bleRadio.println("AT+BLEUARTTX=ARMED");
+      bleRadio.println("AT+BLEUARTTX=ST:ARMED");
       logActivity("EVENT", "Armed");
 
       // Compute the launch point altitude
@@ -517,6 +548,7 @@ void readyStateLoop() {
         // Go to fault state
         state = FAULT;
         logActivity("ERROR", "Error reading altimeter sensor data");
+        bleRadio.println("AT+BLEUARTTX=ER:BMP390");
 #ifdef DEBUG
         printAltimeterError("Error reading altimeter sensor data: ", altimeterErrorCode);
 #endif
@@ -533,6 +565,7 @@ void readyStateLoop() {
         // Leave the log file open to save time during logging of sensor readings
       } else {
         logActivity("ERROR", "SD Card write error");
+        bleRadio.println("AT+BLEUARTTX=ER:SD Card Write");
     
 #ifdef DEBUG
         Serial.println("SD card write error");
@@ -540,10 +573,10 @@ void readyStateLoop() {
       }
       
       } else {
-        bleRadio.println("AT+BLEUARTTX=Rocket must be upright to arm");
+        bleRadio.println("AT+BLEUARTTX=ER:Not Vertical");
       }
     } else {
-      bleRadio.println("AT+BLEUARTTX=Expected arm command");
+      bleRadio.println("AT+BLEUARTTX=MS:Expected arm cmd");
     }
   }
 
@@ -569,8 +602,9 @@ void readyStateLoop() {
     if (lipoBatteryVoltage < BAT_VOLT_LOW) {
       state = FAULT;
       logActivity("ERROR", "Battery voltage low");
-      bleRadio.println("AT+BLEUARTTX=Battery Low");
-      bleRadio.println("AT+BLEUARTTX=FAULT - Not Armed");
+      bleRadio.println("AT+BLEUARTTX=MS:Battery Low");
+      delay(20);
+      bleRadio.println("AT+BLEUARTTX=ST:ERROR");
     }
   }
 }
@@ -597,7 +631,7 @@ void armedStateLoop() {
     if (strcmp(bleRadio.buffer, "disarm") == 0) {
       // We are disarmed
       state = READY;
-      bleRadio.println("AT+BLEUARTTX=READY");
+      bleRadio.println("AT+BLEUARTTX=ST:READY");
       logActivity("EVENT", "Disarmed");
       closeDataFile();
       digitalWrite(LED, LOW);
@@ -618,6 +652,7 @@ void armedStateLoop() {
     state = LOGGING;
     digitalWrite(LED, LOW); // Make sure the on-board LED is off
     logActivity("EVENT", "Launch");
+    bleRadio.println("AT+BLEUARTTX=ST:LAUNCHED");
     return;
   }
   
@@ -702,11 +737,13 @@ timeOutCounter++;
           (accelerometer_gyro.getZAxisRate() < NO_MOTION_UPPER) && 
           (accelerometer_gyro.getZAxisRate() > NO_MOTION_LOWER)) {
             postFlightDataLog("LANDED");
+            bleRadio.println("AT+BLEUARTTX=ST:LANDED");
           }
 
         // Check for timeout
         if (timeOutCounter * TC3_INT_PERIOD > TIME_OUT * 1000) {
           postFlightDataLog("TIMEOUT");
+          bleRadio.println("AT+BLEUARTTX=ST:LANDED");
           timeOutCounter = 0;
         }
 
@@ -733,24 +770,25 @@ void postFlightStateLoop() {
   flashLED(LED_PPS_POST_FLIGHT);
   if (bleRadio.isConnected() && sent != true) {
     delay(5000);
-    bleRadio.print("AT+BLEUARTTX=");
-    bleRadio.print("Max Alt: ");
-    bleRadio.println(maxAltitude);
+
+    String dataString = "AT+BLEUARTTX=AL:";
+    dataString += String(maxAltitude);
+    bleRadio.println(dataString);
+    delay(20);
     
-    bleRadio.print("AT+BLEUARTTX=");
-    bleRadio.print("Max Accel: ");
-    bleRadio.println(maxAcceleration);
+    dataString = "AT+BLEUARTTX=AC:";
+    dataString += String(maxAcceleration);
+    bleRadio.println(dataString);
+    delay(20);
 
-    bleRadio.print("AT+BLEUARTTX=");
-    bleRadio.print("Max Velocity: ");
-    bleRadio.println(maxVelocity);
+    dataString = "AT+BLEUARTTX=DU:";
+    dataString += String(flightLength);
+    bleRadio.println(dataString);
+    delay(20);
 
-    bleRadio.print("AT+BLEUARTTX=");
-    bleRadio.print("Flight Length: ");
-    bleRadio.println(flightLength);
 
-    bleRadio.print("AT+BLEUARTTX=");
-    bleRadio.println("Launch Again?");
+    bleRadio.println("AT+BLEUARTTX=AT:AGAIN");
+    delay(20);
 
     
     sent = true;
@@ -771,7 +809,7 @@ void postFlightStateLoop() {
         prevTime = 0;
         prevAcc = 0.0; // f/sec2
         prevVelocity = 0;
-        bleRadio.println("AT+BLEUARTTX=READY");
+        bleRadio.println("AT+BLEUARTTX=ST:READY");
         logActivity("EVENT", "READY");
         sent = false;
       }
@@ -957,10 +995,15 @@ double readBatteryVoltage(void) {
 // device.
 // ==========================================================================
 void displayBatteryLevel(void) {
-  String voltageMessage = "AT+BLEUARTTX=Battery Voltage: ";
-  voltageMessage += lipoBatteryVoltage;
-  voltageMessage += " V";
-  bleRadio.println(voltageMessage);
+  if (lipoBatteryVoltage >= BAT_VOLT_FULL) {
+    bleRadio.println("AT+BLEUARTTX=BT:FULL");
+  } else if (lipoBatteryVoltage >= BAT_VOLT_OK) {
+    bleRadio.println("AT+BLEUARTTX=BT:OK");
+  } else if (lipoBatteryVoltage >= BAT_VOLT_LOW) {
+    bleRadio.println("AT+BLEUARTTX=BT:LOW");
+  } else {
+    bleRadio.println("AT+BLEUARTTX=BT:CRITICAL");
+  }
   
 }
 
@@ -1102,7 +1145,7 @@ uint8_t computeLaunchPointAlt() {
   logActivity("EVENT", flightEndCause);
   // Log the maximum acceleration and altitude
   uint32_t landTime = millis();
-  uint32_t flightLength = landTime - launchTime;
+  flightLength = landTime - launchTime;
   flightLength /= 1000;
   String logString = "Maximum acceleration = ";
   logString += maxAcceleration;
@@ -1114,7 +1157,7 @@ uint8_t computeLaunchPointAlt() {
   logActivity("STATUS", logString);
   logString = "FLight duration = ";
   logString += flightLength;
-  logString += "sec";
+  logString += " sec";
   logActivity("STATUS", logString);
   logString = "Maximum velocity = ";
   logString += maxVelocity;
