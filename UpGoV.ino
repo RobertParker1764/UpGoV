@@ -1,7 +1,7 @@
  // UpGoer5Instrumentation
-// Version: Beta 6
+// Version: Beta 7
 // Author: Bob Parker
-// Date: 7/4/2023
+// Date: 9/2/2023
 // Tested: 
 //
 // Code for a model rocket instrumentation package. Measures and logs acceleration and turning
@@ -47,6 +47,14 @@
 // Beta 6:
 // Added integration with IOS UpGoV app.
 
+// Beta 7: Replaced bluetooth radio with RFM95 LoRa radio.
+//         Added GPS Sensor (Adafruit Ultimate GPS Featherwing). Lat/Lon/Alt data and antenna health will be reported via radio.
+//         Added 400G Accelerometer sensor (Adafruit H3LIS331)
+//         Added 2 addition in-flight event outputs (Now labeled event 1 through event 4)
+//         Removed the Real Time Clock on the Adalogger Feather wing. Date/time data obtained from GPS
+//         Now using an SD card breakout instead of the Adalogger featherwing
+//         Added measurement of in-flight event battery voltage (7.4 volts). Report status via radio
+
 // ==============================  Include Files  ==================================
 #include <SPI.h>                      // Sensor and micro SD card communication
 #include <SD.h>                       // SD card library functions
@@ -56,17 +64,23 @@
 #include "RTClib.h"                   // Real Time Clock library by Adafruit
 #include "Adafruit_BLE.h"             // Bluetooth link library
 #include "Adafruit_BluefruitLE_SPI.h" // SPI library for bluetooth module
+#include <RWP_GPS.h>                  // GPS Library
 
 
 // ===============================  Constants  =====================================
 //#define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
-const String VERSION = "Beta 6.01";
+#define GPSSerial Serial1
+#define GPSECHO false
+
+const String VERSION = "Beta 7.01";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
 const uint8_t LSM6DSO32_CS = 6;
-const uint8_t SD_CARD_CS = A5;   // Adalogger board must be modified to change CS from 10 (default) to A5
+const uint8_t SD_CARD_CS = A5;
+const uint8_t H3LIS331_CS = SDA;
+const uint8_t GPS_ENABLE = SCL;
 const uint8_t LED = 13;
 const uint8_t BLUEFRUIT_SPI_CS = 8;
 const uint8_t BLUEFRUIT_SPI_IRQ = 7;
@@ -75,7 +89,12 @@ const uint8_t SENSOR_SPI_CLK = 12;
 const uint8_t SENSOR_SPI_MOSI = 10;
 const uint8_t SENSOR_SPI_MISO = 11;
 const uint8_t BATTERY_MONITOR = 9;
-const uint8_t PARACHUTE_RELEASE = A4;
+const uint8_t INFLIGHT_EVENT_BATTERY_MONITOR = A0;
+const uint8_t INFLIGHT_EVENT_1 = A1;
+const uint8_t INFLIGHT_EVENT_2 = A2;
+const uint8_t INFLIGHT_EVENT_3 = A3;
+const uint8_t INFLIGHT_EVENT_4 = A4;
+
 // Other Constants
 const uint8_t TC3_INT_PERIOD = 10;          // RTC interrupt period in milliseconds
 const uint16_t LED_PPS_FAULT = 100;          // LED pulse rate while in FAULT state
@@ -108,6 +127,7 @@ BMP3XX altimeter;  // Altimeter sensor object instance
 LSM6DSO32 accelerometer_gyro;  //Accelerometer/Gyro sensor object instance
 RTC_PCF8523 realTimeClock;
 Adafruit_BluefruitLE_SPI bleRadio(BLUEFRUIT_SPI_CS, BLUEFRUIT_SPI_IRQ, BLUEFRUIT_SPI_RST);  // Object manages the Bluetooth LE peripheral
+Adafruit_GPS gps(&GPSSerial);
 
 double temperature = 0.0;       // Temperature in degrees C
 double pressure = 0.0;          // Pressure in hpa
@@ -182,9 +202,9 @@ void setup() {
   bleRadio.sendCommandCheckOK("AT+HWModeLED=MODE");
 
   // Wait for bluetooth radio connection
-  while (!bleRadio.isConnected()) {
-    delay(500);
-  }
+  //while (!bleRadio.isConnected()) {
+    //delay(500);
+  //}
 
   delay(1000);
 
@@ -201,8 +221,14 @@ void setup() {
   // Configure the GPIO pins
   pinMode(LED, OUTPUT);   // Use this digital output to observe the TC3 interrupt
   PORT->Group[0].OUTCLR.reg = PORT_PA17; // Turn off the on-board LED
-  pinMode(PARACHUTE_RELEASE, OUTPUT);
-  digitalWrite(PARACHUTE_RELEASE, LOW);
+  pinMode(INFLIGHT_EVENT_1, OUTPUT);
+  digitalWrite(INFLIGHT_EVENT_1, LOW);
+  pinMode(INFLIGHT_EVENT_2, OUTPUT);
+  digitalWrite(INFLIGHT_EVENT_2, LOW);
+  pinMode(INFLIGHT_EVENT_3, OUTPUT);
+  digitalWrite(INFLIGHT_EVENT_3, LOW);
+  pinMode(INFLIGHT_EVENT_4, OUTPUT);
+  digitalWrite(INFLIGHT_EVENT_4, LOW);
   bleRadio.println("AT+BLEUARTTX=MS:Port Pins Init");
   delay(20);
 
@@ -453,7 +479,13 @@ void setup() {
   logActivity("STATUS", "Altimeter settings and power mode initialized");
   bleRadio.println(F("AT+BLEUARTTX=MS:BMP390 Init"));
   delay(20);
+
+  // ====================== GPS Setup  ==================================
   
+  gps.begin(9600);
+  gps.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  gps.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+  gps.sendCommand(PGCMD_ANTENNA);
 
   // ======================= Ready State Check ===========================
 
@@ -527,6 +559,9 @@ void readyStateLoop() {
   static uint16_t counter = 0;  // Used to compute when a battery check is needed
 
   accelerometer_gyro.readSensorData();
+
+  // Read GPS data
+  checkGPS();
   
   // Check for an ARM event every time through the loop
   bleRadio.println("AT+BLEUARTRX");
@@ -696,12 +731,12 @@ timeOutCounter++;
   // Check if we are at the apogee
   if(maxAltitude < 75) {
     if(altitude < (maxAltitude - 1)) {
-      digitalWrite(PARACHUTE_RELEASE, HIGH); 
+      digitalWrite(INFLIGHT_EVENT_1, HIGH); 
       parachute_released = true;
     }
   } else {
     if(altitude < (maxAltitude - 10)) {
-      digitalWrite(PARACHUTE_RELEASE, HIGH); 
+      digitalWrite(INFLIGHT_EVENT_1, HIGH); 
       parachute_released = true;
     }
   }
@@ -750,7 +785,7 @@ timeOutCounter++;
     // Checks if we need to turn off the parachute release signal
     parachute_signal_timer++;
     if(parachute_signal_timer >= (PARACHUTE_SIGNAL_DURATION / TC3_INT_PERIOD)) {
-      digitalWrite(PARACHUTE_RELEASE, LOW);
+      digitalWrite(INFLIGHT_EVENT_1, LOW);
     }
 
 #ifdef DEBUG
@@ -1230,4 +1265,25 @@ void computeAverageAcceleration() {
   }
 
   
+}
+
+// ======================== checkGPS =================================
+// Checks for and processes GPS messages.
+// ===================================================================
+void checkGPS() {
+  // Read data from the GPS
+  char c = gps.read();
+  
+#ifdef DEBUG
+  if (c) {
+    Serial.print(c);
+  }
+#endif
+
+  if (gps.newNMEAreceived()) {
+    Serial.print(gps.lastNMEA());
+    if (!gps.parse(gps.lastNMEA())) {
+      return;
+    }
+  }
 }
