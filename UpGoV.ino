@@ -48,12 +48,13 @@
 // Added integration with IOS UpGoV app.
 
 // Beta 7: Replaced bluetooth radio with RFM95 LoRa radio.
-//         Added GPS Sensor (Adafruit Ultimate GPS Featherwing). Lat/Lon/Alt data and antenna health will be reported via radio.
+//         Added GPS Sensor (Adafruit Ultimate GPS Featherwing). Lat/Lon/Alt datawill be reported via radio.
 //         Added 400G Accelerometer sensor (Adafruit H3LIS331)
 //         Added 2 addition in-flight event outputs (Now labeled event 1 through event 4)
 //         Removed the Real Time Clock on the Adalogger Feather wing. Date/time data obtained from GPS
 //         Now using an SD card breakout instead of the Adalogger featherwing
 //         Added measurement of in-flight event battery voltage (7.4 volts). Report status via radio
+//         Incorporate power saving measures
 
 // ==============================  Include Files  ==================================
 #include <SPI.h>                      // Sensor and micro SD card communication
@@ -65,10 +66,12 @@
 #include "Adafruit_BLE.h"             // Bluetooth link library
 #include "Adafruit_BluefruitLE_SPI.h" // SPI library for bluetooth module
 #include <RWP_GPS.h>                  // GPS Library
+#include <RH_RF95.h>                  // Radio Head driver class
+#include <H3LIS331.hpp>               // H3LIS331 sensor library code
 
 
 // ===============================  Constants  =====================================
-//#define DEBUG // Uncomment to enable debug comments printed to the console
+#define DEBUG // Uncomment to enable debug comments printed to the console
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
 #define GPSSerial Serial1
 #define GPSECHO false
@@ -82,6 +85,9 @@ const uint8_t SD_CARD_CS = A5;
 const uint8_t H3LIS331_CS = SDA;
 const uint8_t GPS_ENABLE = SCL;
 const uint8_t LED = 13;
+const uint8_t RADIO_SPI_CS = 8;
+const uint8_t RADIO_SPI_IRQ = 3;
+const uint8_t RFM95_RST = 4;
 const uint8_t BLUEFRUIT_SPI_CS = 8;
 const uint8_t BLUEFRUIT_SPI_IRQ = 7;
 const uint8_t BLUEFRUIT_SPI_RST = 4;
@@ -96,7 +102,7 @@ const uint8_t INFLIGHT_EVENT_3 = A3;
 const uint8_t INFLIGHT_EVENT_4 = A4;
 
 // Other Constants
-const uint8_t TC3_INT_PERIOD = 10;          // RTC interrupt period in milliseconds
+const uint8_t TC5_INT_PERIOD = 10;          // RTC interrupt period in milliseconds
 const uint16_t LED_PPS_FAULT = 100;          // LED pulse rate while in FAULT state
 const uint16_t LED_PPS_ARMED = 200;          // LED pulse rate while in ARMED state
 const uint16_t LED_PPS_POST_FLIGHT = 10000;  // LED pulse period (ms) in POST_FLIGHT state
@@ -114,6 +120,10 @@ const uint16_t TIME_OUT = 30;               // Number of seconds after which we 
 const double LAUNCH_ACCEL = 0.2;             // Threshold for launch determination in G's
 const uint16_t PARACHUTE_SIGNAL_DURATION = 2000;  // Duration of parachute release signal in milliseconds
 const double GRAVITY_ACC = 32.174;          // The acceleration on the surface of the Earth in f/sec2
+const uint8_t CLIENT_ADDRESS = 2;
+const uint8_t SERVER_ADDRESS = 1;
+const double RF95_FREQ = 915.0;
+
 
 enum states {START_UP, FAULT, READY, ARMED, LOGGING, POST_FLIGHT};
 enum errors {NONE, GYRO, ACCEL, ALT, BATTERY};
@@ -125,14 +135,15 @@ volatile bool rtcInterruptFlag = false;   // Flag set by rtc interrupt handler
 SPIClass sensorSPI(&sercom1, 11, 12, 10, SPI_PAD_2_SCK_3, SERCOM_RX_PAD_0); // The sensor SPI bus instance
 BMP3XX altimeter;  // Altimeter sensor object instance
 LSM6DSO32 accelerometer_gyro;  //Accelerometer/Gyro sensor object instance
+H3LIS331 accelHighG;          // H3LIS331 high accelerometer object instance
 RTC_PCF8523 realTimeClock;
-Adafruit_BluefruitLE_SPI bleRadio(BLUEFRUIT_SPI_CS, BLUEFRUIT_SPI_IRQ, BLUEFRUIT_SPI_RST);  // Object manages the Bluetooth LE peripheral
+RH_RF95 radioDriver; // LoRa radio driver object
+//Adafruit_BluefruitLE_SPI bleRadio(BLUEFRUIT_SPI_CS, BLUEFRUIT_SPI_IRQ, BLUEFRUIT_SPI_RST);
 Adafruit_GPS gps(&GPSSerial);
 
 double temperature = 0.0;       // Temperature in degrees C
 double pressure = 0.0;          // Pressure in hpa
 double altitude = 0.0;           // Altitude in meters
-double baseAltitude = 0.0;       // The altitude of the rocket launch pad
 int8_t altimeterErrorCode = 0;  // Result code returned from BMP390 API calls
 bool readyForLaunch = false;
 bool dataFileOpen = false;
@@ -143,7 +154,7 @@ double lipoBatteryVoltage = 0;   // Battery voltage of LiPo battery as measured 
 states state = START_UP;        // The current state
 errors error = NONE;            // Error
 double maxAcceleration = 0;      // The maximum axial acceleration measured during flight
-double maxAltitude = 0; // The maximum altitude measured during flight
+double maxAltitude = 0;          // The maximum altitude measured during flight
 uint32_t flightLength = 0;
 double velocity = 0;
 double maxVelocity = 0;
@@ -152,18 +163,24 @@ double earthAccelerationMeasAvg = 1.0;  // Average measured earth acceleration
 uint32_t prevTime = 0;
 double prevAcc = 0.0; // f/sec2
 double prevVelocity = 0;
+bool GPS_FIX = false;
+double launchPointLat;
+double launchPointLon;
+double launchPointAlt;          // Altitude above MSL in meters
+double baroAltitudeError;       // Difference between baro computed alt and GPS alt
+int16_t packetnum = 0;          // packet counter, we increment per xmission
 
-// =======================  TC3 Interrupt Handler  ===================================
-// TC3 will generate an interrupt at a rate determined by TC3_INT_PERIOD to drive the 
+// =======================  TC5 Interrupt Handler  ===================================
+// TC5 will generate an interrupt at a rate determined by TC5_INT_PERIOD to drive the 
 // measurement/logging cycle. The required interrupt handler name is specified in CMSIS 
 // file samd21g18a.h. The interrupt handler will simply set a flag so the loop code 
 // can respond accordingly.
-void TC3_Handler(void) {
+void TC5_Handler(void) {
   // The first step is to clear the interrupt flag
   // The only interrupt enabled is MC0 so we don't need to read the interrupt flag
   // register to see which interrupt triggered
   // Writing a 1 to the flag bit will clear the interrupt flag
-  TC3->COUNT8.INTFLAG.bit.MC0 = 1;
+  TC5->COUNT8.INTFLAG.bit.MC0 = 1;
 
   // Now set the rtcInterruptFlag
   rtcInterruptFlag = true;
@@ -183,8 +200,77 @@ void setup() {
     
 #endif
 
+// ============================ Configure GPIO Pins ==================================
+
+  // Configure the GPIO pins
+  pinMode(LED, OUTPUT);   // Use this digital output to observe the TC3 interrupt
+  PORT->Group[0].OUTCLR.reg = PORT_PA17; // Turn off the on-board LED
+  pinMode(INFLIGHT_EVENT_1, OUTPUT);
+  digitalWrite(INFLIGHT_EVENT_1, LOW);
+  pinMode(INFLIGHT_EVENT_2, OUTPUT);
+  digitalWrite(INFLIGHT_EVENT_2, LOW);
+  pinMode(INFLIGHT_EVENT_3, OUTPUT);
+  digitalWrite(INFLIGHT_EVENT_3, LOW);
+  pinMode(INFLIGHT_EVENT_4, OUTPUT);
+  digitalWrite(INFLIGHT_EVENT_4, LOW);
+  pinMode(RFM95_RST, OUTPUT);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(20);
+
+  // ========================== LoRa Radio Initialization ============================
+  // Reset the LoRa radio
+  digitalWrite(RFM95_RST, LOW);
+  delay(10);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(10);
+
+  // Initialize the LoRa radio
+  if (!radioDriver.init()) {
+#ifdef DEBUG
+    Serial.println("Radio init() error");
+#endif
+  }
+
+  // Set the LoRa radio operating frequency
+  if (!radioDriver.setFrequency(RF95_FREQ)) {
+#ifdef DEBUG
+    Serial.println("Failed to set LoRa radio frequency");
+#endif
+
+  // Set the LoRa radio transmit power
+  radioDriver.setTxPower(23, false);
+#ifdef DEBUG
+  Serial.println("Radio initialized");
+  Serial.println("Waiting for ground station connect");
+#endif
+
+  // Block here until we connect to the UpGoV Ground Station
+  bool connected = false;
+  while (!connected) {
+    if (radioDriver.available()) {
+      // Message received. Check for a connect message
+      char messageBuffer[RH_RF95_MAX_MESSAGE_LEN];
+      uint8_t messageLength = sizeof(messageBuffer);
+      if (radioDriver.recv((uint8_t *)messageBuffer, &messageLength)) {
+        // Check message length
+        if (messageLength != 0) {
+          if (!strncmp(messageBuffer, "connect", 7)) {
+            // Connect message received
+            connected = true;
+            // Send the reply
+            uint8_t data[] = "connect";
+            radioDriver.send(data, sizeof(data));
+            radioDriver.waitPacketSent();
+            
+          }
+        }
+      }
+    }
+  } // End radio connect loop
+
+  }
   // ======================== Bluetooth Radio Initialization =========================
-  
+  /*
 #ifdef DEBUG
   Serial.print(F("Initializing Bluetooth LE module: "));
 #endif
@@ -202,9 +288,9 @@ void setup() {
   bleRadio.sendCommandCheckOK("AT+HWModeLED=MODE");
 
   // Wait for bluetooth radio connection
-  //while (!bleRadio.isConnected()) {
-    //delay(500);
-  //}
+  while (!bleRadio.isConnected()) {
+    delay(500);
+  }
 
   delay(1000);
 
@@ -215,22 +301,8 @@ void setup() {
 #ifdef DEBUG
   Serial.println(F("Bluetooth link connected"));
 #endif
-
-  // ============================ Configure GPIO Pins ==================================
-
-  // Configure the GPIO pins
-  pinMode(LED, OUTPUT);   // Use this digital output to observe the TC3 interrupt
-  PORT->Group[0].OUTCLR.reg = PORT_PA17; // Turn off the on-board LED
-  pinMode(INFLIGHT_EVENT_1, OUTPUT);
-  digitalWrite(INFLIGHT_EVENT_1, LOW);
-  pinMode(INFLIGHT_EVENT_2, OUTPUT);
-  digitalWrite(INFLIGHT_EVENT_2, LOW);
-  pinMode(INFLIGHT_EVENT_3, OUTPUT);
-  digitalWrite(INFLIGHT_EVENT_3, LOW);
-  pinMode(INFLIGHT_EVENT_4, OUTPUT);
-  digitalWrite(INFLIGHT_EVENT_4, LOW);
-  bleRadio.println("AT+BLEUARTTX=MS:Port Pins Init");
-  delay(20);
+*/
+  
 
   // ======================  Initialize the Sensor SPI Bus  ============================
   sensorSPI.begin();
@@ -240,7 +312,7 @@ void setup() {
   pinPeripheral(10, PIO_SERCOM);
   pinPeripheral(11, PIO_SERCOM);
   pinPeripheral(12, PIO_SERCOM);
-  bleRadio.println("AT+BLEUARTTX=MS:Sensor SPI Init");
+  //bleRadio.println("AT+BLEUARTTX=MS:Sensor SPI Init");
   delay(20);
 
   // ============================ SD Card Library Setup ================================
@@ -249,22 +321,22 @@ void setup() {
 #ifdef DEBUG
     Serial.println("SD card failed to initialize");
 #endif
-    bleRadio.println("AT+BLEUARTTX=ER:SD Card Init");
+    //bleRadio.println("AT+BLEUARTTX=ER:SD Card Init");
     delay(20);
-    bleRadio.println("AT+BLEUARTTX=ST:ERROR");
+    //bleRadio.println("AT+BLEUARTTX=ST:ERROR");
     delay(20);
     while(1); // Hang here
   } else {
 #ifdef DEBUG
     Serial.println("SD card initialized");
 #endif
-    bleRadio.println("AT+BLEUARTTX=MS:SD Card Init");
+    //bleRadio.println("AT+BLEUARTTX=MS:SD Card Init");
     delay(20);
   }
 
   // ======================  SAMD21 Generic Clock Setup  ====================
   // Configure Generic Clock 6. It will we used as the source clock for the
-  // TC3 peripheral. Generic Clock 6 will output 16KHz clock.
+  // TC5TCC2_ peripheral. Generic Clock 6 will output 16KHz clock.
   // ========================================================================
 
   GCLK->GENDIV.reg =  GCLK_GENDIV_ID(0x06) |     // Generic Clock 6
@@ -275,51 +347,51 @@ void setup() {
                       GCLK_GENCTRL_ID(0x06);     // Generic Clock 6
   while (GCLK->STATUS.bit.SYNCBUSY);
   GCLK->CLKCTRL.reg = GCLK_CLKCTRL_GEN_GCLK6 |   // Generic Clock 6
-                      GCLK_CLKCTRL_ID_TCC2_TC3 | // TC3 will use generic clock 6
+                      GCLK_CLKCTRL_ID_TC4_TC5 | // TC3 will use generic clock 6
                       GCLK_CLKCTRL_CLKEN;        // Enable generic clock
 
 #ifdef DEBUG
   Serial.println("Generic clock initialized");
 #endif
-  bleRadio.println("AT+BLEUARTTX=MS:GCLK 6 Init");
+  //bleRadio.println("AT+BLEUARTTX=MS:GCLK 6 Init");
   delay(20);
 
-  // =============================  TC3 Setup  ==============================
-  // TC3 is used to generate a periodic interrupt to drive all activity.
+  // =============================  TC5 Setup  ==============================
+  // TC5 is used to generate a periodic interrupt to drive all activity.
   // ========================================================================
-  // Enable the TC3 bus clock
-  PM->APBCMASK.reg |= PM_APBCMASK_TC3;
+  // Enable the TC5 bus clock
+  PM->APBCMASK.reg |= PM_APBCMASK_TC5;
 
-  //Disable TC3
-  TC3->COUNT8.CTRLA.bit.ENABLE = 0;
-  while (TC3->COUNT8.STATUS.bit.SYNCBUSY);
+  //Disable TC5
+  TC5->COUNT8.CTRLA.bit.ENABLE = 0;
+  while (TC5->COUNT8.STATUS.bit.SYNCBUSY);
 
-  // Enable the TC3 OVF (overflow) interrupt
-  TC3->COUNT8.INTENSET.reg = TC_INTENSET_OVF;
+  // Enable the TC5 OVF (overflow) interrupt
+  TC5->COUNT8.INTENSET.reg = TC_INTENSET_OVF;
 
-  // Configure TC3 Control A register settings
+  // Configure TC5 Control A register settings
   // PRESCALER set to divide by 16
   // MODE set to 8-bit counter
-  TC3->COUNT8.CTRLA.reg = TC_CTRLA_MODE_COUNT8 |      // 8-bit counter mode
+  TC5->COUNT8.CTRLA.reg = TC_CTRLA_MODE_COUNT8 |      // 8-bit counter mode
                           TC_CTRLA_WAVEGEN_NPWM |     // PER register used as TOP value
                           TC_CTRLA_PRESCALER_DIV16 |  // Divide GCLK by 16 (1KHz counter clock)
                           TC_CTRLA_PRESCSYNC_GCLK;    // Wrap around on next GCLK tick
 
   //Set the PER register value
-  TC3->COUNT8.PER.reg = TC3_INT_PERIOD;
-  while (TC3->COUNT8.STATUS.bit.SYNCBUSY);
+  TC5->COUNT8.PER.reg = TC5_INT_PERIOD;
+  while (TC5->COUNT8.STATUS.bit.SYNCBUSY);
 
-  // Enable the TC3 interrupt in the NVIC
+  // Enable the TC5 interrupt in the NVIC
   NVIC_DisableIRQ(TC5_IRQn);
   NVIC_ClearPendingIRQ(TC5_IRQn);
-  NVIC_SetPriority(TC3_IRQn, 0);
-  NVIC_EnableIRQ(TC3_IRQn);
+  NVIC_SetPriority(TC5_IRQn, 0);
+  NVIC_EnableIRQ(TC5_IRQn);
 
 #ifdef DEBUG
-  Serial.println("TC3 initialized");
+  Serial.println("TC5 initialized");
 #endif
 
-  bleRadio.println("AT+BLEUARTTX=MS:TC3 Init");
+  //bleRadio.println("AT+BLEUARTTX=MS:TC5 Init");
   delay(20);
 
   // =============================== ADC Setup ==========================
@@ -338,44 +410,31 @@ void setup() {
   Serial.println("ADC initialized");
 #endif
 
-  bleRadio.println("AT+BLEUARTTX=MS:ADC Init");
+  //bleRadio.println("AT+BLEUARTTX=MS:ADC Init");
   delay(20);
 
-  // ======================== Real Time Clock Setup =====================
-  // The Real Time Clock on the Adalogger Feather Wing is used to create
-  // a unique file name for the data log file. The file name uses the 
-  // current date and minute to create a file name.
-  // ====================================================================
-  if (!realTimeClock.begin()) {
+  // ====================== GPS Setup  ==================================
+
+  // Initialize the GPS module
+  gps.begin(9600);
+  // Turn on the RMC and GGA NMEA sentences from which we can parse
+  // all of the GPS information that we need
+  gps.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  gps.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+
+  // Hold here until we get a GPS fix
+  while (!GPS_FIX) {
+    //Check for a new NMEA sentence and parse the results if received
+    checkGPS();
+    //if (gps.fix) {
+    if (true) {
+      GPS_FIX = true;
 #ifdef DEBUG
-    Serial.println("Real Time Clock not found");
+      Serial.println("GPS Fix");
 #endif
-    bleRadio.println("AT+BLEUARTTX=ER:RTC");
-    bleRadio.println("AT+BLEUARTTX=ST:ERROR");
-    state = FAULT;
-    logActivity("ERROR", "Real Time Clock not found");
+    }
+    delay(10);
   }
-
-  if (!realTimeClock.initialized() || realTimeClock.lostPower())  {
-    // Need to initialize the real time clock date and time
-#ifdef DEBUG
-    Serial.println("Initializing real time clock date and time");
-#endif
-    logActivity("STATUS", "Initializing real time clock date and time");
-    delay(2000);  // Wait for real time clock crystal to stabilize befor calling adust()
-    realTimeClock.adjust(DateTime(F(__DATE__), F(__TIME__)));
-  }
-
-  // Start the Real Time Clock
-  realTimeClock.start();
-  logActivity("STATUS", "Real Time Clock started");
-  bleRadio.println("AT+BLEUARTTX=MS:RTC Init");
-  delay(20);
-
-#ifdef DEBUG
-  Serial.println("Real time clock initialized");
-#endif
-
 
 
   // ===================== LSM6DSO32 Sensor Setup =======================
@@ -394,10 +453,10 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the accelerometer/gyro sensor");
-    bleRadio.println("AT+BLEUARTTX=ER:LSM6DS032 Error");
+    //bleRadio.println("AT+BLEUARTTX=ER:LSM6DS032 Error");
     delay(20);
   } else {
-    bleRadio.println("AT+BLEUARTTX=MS:LSM6DS032 Init");
+    //bleRadio.println("AT+BLEUARTTX=MS:LSM6DS032 Init");
     delay(20);
 #ifdef DEBUG
     Serial.println("Accelerometer/Gyro sensor initilaized");
@@ -412,6 +471,39 @@ void setup() {
 
   logActivity("STATUS", "Accelerometer/gyro sensor initialized");
 
+// ======================== H3LIS331 Sensor Setup =======================
+  // The H3LIS331 is a high G accelerometer. It is used to 
+  // measure acceleration along the 3 axis. The X-Axis
+  // is aligned along the rockets longitudinal axis (top to bottom).
+  // ====================================================================
+
+  // Initialize the accelerometer sensor
+#ifdef DEBUG
+  Serial.println("Initializing H3LIS331 accelerometer"); 
+#endif
+  if (!accelHighG.begin(H3LIS331_CS, &sensorSPI)) {
+#ifdef DEBUG
+    Serial.println("Error initializing H3LIS331 accelerometer sensor");
+#endif
+    state = FAULT;
+    logActivity("ERROR", "Error initializing the H3LIS331 accelerometer sensor");
+    //bleRadio.println("AT+BLEUARTTX=ER:H3LIS331 Error");
+    delay(20);
+  } else {
+    //bleRadio.println("AT+BLEUARTTX=MS:H3LIS331 Init");
+    delay(20);
+#ifdef DEBUG
+    Serial.println("H3LIS331 accelerometer sensor initilaized");
+#endif
+  }
+
+  // Configure accelerometer settings
+  accelHighG.setRange(H3LIS331DL_200g);
+  accelHighG.setOutputDataRate(H3LIS331DL_ODR_100Hz);
+  
+  logActivity("STATUS", "H3LIS331 accelerometer sensor initialized");
+
+  
   // ====================== BMP390 Sensor Setup  ========================
   // The BMP390 is a barometric pressure sensor that is used to measure
   // air pressure and temperature. Altitude is computed from the air
@@ -427,7 +519,7 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the altimeter sensor");
-    bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
+    //bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
   } else {
 #ifdef DEBUG
     Serial.println("Altimeter sensor initialized");
@@ -454,7 +546,7 @@ void setup() {
     printAltimeterError("Error writing altimeter settings:", altimeterErrorCode);
 #endif
     logActivity("ERROR", "Error writing altimeter settings");
-    bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
+    //bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
     delay(20);
     state = FAULT;
   }
@@ -471,34 +563,28 @@ void setup() {
     printAltimeterError("Error writing altimeter power mode:", altimeterErrorCode);
 #endif
     logActivity("ERROR", "Error writing altimeter power mode");
-    bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
+    //bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
     delay(20);
     state = FAULT;
   }
 
   logActivity("STATUS", "Altimeter settings and power mode initialized");
-  bleRadio.println(F("AT+BLEUARTTX=MS:BMP390 Init"));
+  //bleRadio.println(F("AT+BLEUARTTX=MS:BMP390 Init"));
   delay(20);
 
-  // ====================== GPS Setup  ==================================
-  
-  gps.begin(9600);
-  gps.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
-  gps.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
-  gps.sendCommand(PGCMD_ANTENNA);
 
   // ======================= Ready State Check ===========================
 
-  // Start-up is complete. Move to Ready state if no errors occurred during startup
+  // Start-up is complete. Move to Ready state if no errors occurred during startup 
   if (state != FAULT) {
     state = READY;
     logActivity("EVENT", "Transition to Ready state");
-    bleRadio.println(F("AT+BLEUARTTX=ST:READY"));
+    //bleRadio.println(F("AT+BLEUARTTX=ST:READY"));
   }
 
-  // Enable TC3. We will start getting TC3 interrupts at the TC3_INT_PERIOD
-  TC3->COUNT8.CTRLA.bit.ENABLE = 1;
-  while (TC3->COUNT8.STATUS.bit.SYNCBUSY);
+  // Enable TC5. We will start getting TC5 interrupts at the TC5_INT_PERIOD
+  TC5->COUNT8.CTRLA.bit.ENABLE = 1;
+  while (TC5->COUNT8.STATUS.bit.SYNCBUSY);
   
 } // End setup code
 
@@ -560,12 +646,12 @@ void readyStateLoop() {
 
   accelerometer_gyro.readSensorData();
 
-  // Read GPS data
+  // Read GPS NMEA sentences and update GPS data values
   checkGPS();
   
   // Check for an ARM event every time through the loop
-  bleRadio.println("AT+BLEUARTRX");
-  bleRadio.readline();
+  //bleRadio.println("AT+BLEUARTRX");
+  //bleRadio.readline();
   if (!strcmp(bleRadio.buffer, "OK") == 0) {
     // Some data was received
     String message = bleRadio.buffer;
@@ -574,25 +660,30 @@ void readyStateLoop() {
       if (accelerometer_gyro.getXAxisAccel() > 0.9) {
         // Arm command received
       state = ARMED;
-      bleRadio.println("AT+BLEUARTTX=ST:ARMED");
+      //bleRadio.println("AT+BLEUARTTX=ST:ARMED");
       logActivity("EVENT", "Armed");
 
-      // Compute the launch point altitude
-      delay(100);
-      if (computeLaunchPointAlt() != 0) {
-        // Go to fault state
+      // Save the launch point location info and compute altitude error term
+      launchPointLat = gps.latitude;
+      launchPointLon = gps.longitude;
+      launchPointAlt = gps.altitude;
+      maxAltitude = launchPointAlt;     // Initialize the maximum achieved altitude
+      if (readAltimeterData()) {
+        //Failed to read altimeter data
         state = FAULT;
-        logActivity("ERROR", "Error reading altimeter sensor data");
-        bleRadio.println("AT+BLEUARTTX=ER:BMP390");
 #ifdef DEBUG
-        printAltimeterError("Error reading altimeter sensor data: ", altimeterErrorCode);
+        Serial.println("Error reading altimeter while arming");
 #endif
+        //bleRadio.println("AT+BLEUARTTX=ST:FAULT");
+        return;
       }
+      baroAltitudeError = altitude - launchPointAlt;
       
       // Write the header row to the log file with labels for the data
       // File name to include the date from the Real Time Clock
       // Leave the file open. It will be closed later after all data is logged
-      String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), X_Accel(Gs), Y_Accel(Gs), Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
+      String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
+                          "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
       openDataFile();
       // Write the header string to the data file
       if (dataFile) {
@@ -600,7 +691,7 @@ void readyStateLoop() {
         // Leave the log file open to save time during logging of sensor readings
       } else {
         logActivity("ERROR", "SD Card write error");
-        bleRadio.println("AT+BLEUARTTX=ER:SD Card Write");
+        //bleRadio.println("AT+BLEUARTTX=ER:SD Card Write");
     
 #ifdef DEBUG
         Serial.println("SD card write error");
@@ -608,16 +699,16 @@ void readyStateLoop() {
       }
       
       } else {
-        bleRadio.println("AT+BLEUARTTX=ER:Not Vertical");
+        //bleRadio.println("AT+BLEUARTTX=ER:Not Vertical");
       }
     } else {
-      bleRadio.println("AT+BLEUARTTX=MS:Expected arm cmd");
+      //bleRadio.println("AT+BLEUARTTX=MS:Expected arm cmd");
     }
   }
 
   // Check battery voltage and report via bluetooth radio
   counter++;
-  if (counter >= (BAT_MEAS_PER / TC3_INT_PERIOD)) {
+  if (counter >= (BAT_MEAS_PER / TC5_INT_PERIOD)) {
     counter = 0;  // Reset the counter
     lipoBatteryVoltage = readBatteryVoltage();
 
@@ -637,9 +728,9 @@ void readyStateLoop() {
     if (lipoBatteryVoltage < BAT_VOLT_LOW) {
       state = FAULT;
       logActivity("ERROR", "Battery voltage low");
-      bleRadio.println("AT+BLEUARTTX=MS:Battery Low");
+      //bleRadio.println("AT+BLEUARTTX=MS:Battery Low");
       delay(20);
-      bleRadio.println("AT+BLEUARTTX=ST:ERROR");
+      //bleRadio.println("AT+BLEUARTTX=ST:ERROR");
     }
   }
 }
@@ -657,16 +748,19 @@ void armedStateLoop() {
   // Compute a running average of the measured earth acceleration
   // from the last 5 x-axis acceleration measurements
   computeAverageAcceleration();
+
+  // Read GPS NMEA sentences and update GPS data values
+  checkGPS();
   
   // Check for a DISARM event every time through the loop
-  bleRadio.println("AT+BLEUARTRX");
-  bleRadio.readline();
+  //bleRadio.println("AT+BLEUARTRX");
+  //bleRadio.readline();
   if (!strcmp(bleRadio.buffer, "OK") == 0) {
     // Some data was received
     if (strcmp(bleRadio.buffer, "disarm") == 0) {
       // We are disarmed
       state = READY;
-      bleRadio.println("AT+BLEUARTTX=ST:READY");
+      //bleRadio.println("AT+BLEUARTTX=ST:READY");
       logActivity("EVENT", "Disarmed");
       closeDataFile();
       digitalWrite(LED, LOW);
@@ -687,7 +781,7 @@ void armedStateLoop() {
     state = LOGGING;
     digitalWrite(LED, LOW); // Make sure the on-board LED is off
     logActivity("EVENT", "Launch");
-    bleRadio.println("AT+BLEUARTTX=ST:LAUNCHED");
+    //bleRadio.println("AT+BLEUARTTX=ST:LAUNCHED");
     return;
   }
   
@@ -713,6 +807,7 @@ void armedStateLoop() {
 // ==========================================================================
 void loggingStateLoop() {
 static uint16_t timeOutCounter = 0;
+static uint8_t apogeeDetectedCounter = 0;
 static uint16_t parachute_signal_timer = 0;
 static bool parachute_released = false;
 timeOutCounter++;
@@ -725,38 +820,50 @@ timeOutCounter++;
   // Read the current time
   uint32_t timeInMS = millis();
 
-  // Read the altimeter data
+  // Read the altimeter data and correct altitude
   readAltimeterData();
+  altitude = altitude - baroAltitudeError;
 
-  // Check if we are at the apogee
-  if(maxAltitude < 75) {
-    if(altitude < (maxAltitude - 1)) {
+  // Update the maximum achieved altitude
+  if (altitude > maxAltitude) {
+    maxAltitude = altitude;
+  }
+
+  // Check if we are at the apogee and release the parachute if we are
+  if (atApogee()) {
+    apogeeDetectedCounter++;
+    if (apogeeDetectedCounter >= 5) {
       digitalWrite(INFLIGHT_EVENT_1, HIGH); 
       parachute_released = true;
-    }
-  } else {
-    if(altitude < (maxAltitude - 10)) {
-      digitalWrite(INFLIGHT_EVENT_1, HIGH); 
-      parachute_released = true;
+      apogeeDetectedCounter = 0;
     }
   }
 
-  // Read the accelerometer/gyro sensor data
+  // Read the accelerometer/gyro sensor and high G accelerometer sensor data
   accelerometer_gyro.readSensorData();
+  accelHighG.getAcceleration();
 
-  // Compute velocity
-  velocity = velocityCalculator(timeInMS, accelerometer_gyro.getXAxisAccel() - earthAccelerationMeasAvg);
+  // Compute velocity. Use the high G accelerometer acceleration reading if the 
+  // LSM6DSO32 sensor acceleration reading is greater than 30g
+  float X_AxisAcceleration;
+  if (accelerometer_gyro.getXAxisAccel() > 30.0) {
+    X_AxisAcceleration = accelHighG.getX_Accel();
+  } else {
+    X_AxisAcceleration = accelerometer_gyro.getXAxisAccel();
+  }
+  
+  velocity = velocityCalculator(timeInMS, X_AxisAcceleration - earthAccelerationMeasAvg);
+
+  // Update the maximum velocity
   if (velocity > maxVelocity) {
     maxVelocity = velocity;
   }
 
-  // Update maximum readings
-  if (accelerometer_gyro.getXAxisAccel() > maxAcceleration) {
-    maxAcceleration = accelerometer_gyro.getXAxisAccel();
+  // Update maximum acceleration
+  if (X_AxisAcceleration > maxAcceleration) {
+    maxAcceleration = X_AxisAcceleration;
   }
-  if (altitude > maxAltitude) {
-    maxAltitude = altitude;
-  }
+  
   
   if ((LOG_FILE_DURATION == 0)  || ((timeInMS - launchTime) <= (LOG_FILE_DURATION * 1000))) {
     
@@ -765,26 +872,24 @@ timeOutCounter++;
   }
 
   // Check if we have landed (no more motion)
-      if ((accelerometer_gyro.getXAxisRate() < NO_MOTION_UPPER) &&
-          (accelerometer_gyro.getXAxisRate() > NO_MOTION_LOWER) && 
-          (accelerometer_gyro.getYAxisRate() < NO_MOTION_UPPER) &&
-          (accelerometer_gyro.getYAxisRate() > NO_MOTION_LOWER) &&
-          (accelerometer_gyro.getZAxisRate() < NO_MOTION_UPPER) && 
-          (accelerometer_gyro.getZAxisRate() > NO_MOTION_LOWER)) {
-            postFlightDataLog("LANDED");
-            bleRadio.println("AT+BLEUARTTX=ST:LANDED");
-          }
+  if (isLanded) {
+    state = POST_FLIGHT;
+    postFlightDataLog("LANDED");
+    //bleRadio.println("AT+BLEUARTTX=ST:LANDED");
+  }
+      
 
-        // Check for timeout
-        if (timeOutCounter * TC3_INT_PERIOD > TIME_OUT * 1000) {
-          postFlightDataLog("TIMEOUT");
-          bleRadio.println("AT+BLEUARTTX=ST:LANDED");
-          timeOutCounter = 0;
-        }
+  // Check for timeout
+  if (timeOutCounter * TC5_INT_PERIOD > TIME_OUT * 1000) {
+    state = POST_FLIGHT;
+    postFlightDataLog("TIMEOUT");
+    //bleRadio.println("AT+BLEUARTTX=ST:LANDED");
+    timeOutCounter = 0;
+  }
 
     // Checks if we need to turn off the parachute release signal
     parachute_signal_timer++;
-    if(parachute_signal_timer >= (PARACHUTE_SIGNAL_DURATION / TC3_INT_PERIOD)) {
+    if(parachute_signal_timer >= (PARACHUTE_SIGNAL_DURATION / TC5_INT_PERIOD)) {
       digitalWrite(INFLIGHT_EVENT_1, LOW);
     }
 
@@ -808,28 +913,28 @@ void postFlightStateLoop() {
 
     String dataString = "AT+BLEUARTTX=AL:";
     dataString += String(maxAltitude);
-    bleRadio.println(dataString);
+    //bleRadio.println(dataString);
     delay(20);
     
     dataString = "AT+BLEUARTTX=AC:";
     dataString += String(maxAcceleration);
-    bleRadio.println(dataString);
+    //bleRadio.println(dataString);
     delay(20);
 
     dataString = "AT+BLEUARTTX=DU:";
     dataString += String(flightLength);
-    bleRadio.println(dataString);
+    //bleRadio.println(dataString);
     delay(20);
 
 
-    bleRadio.println("AT+BLEUARTTX=AT:AGAIN");
+    //bleRadio.println("AT+BLEUARTTX=AT:AGAIN");
     delay(20);
 
     
     sent = true;
   }
-  bleRadio.println("AT+BLEUARTRX");
-    bleRadio.readline();
+  //bleRadio.println("AT+BLEUARTRX");
+  //bleRadio.readline();
     if (!strcmp(bleRadio.buffer, "OK") == 0) {
       // Some data was received
       String launchAgain = bleRadio.buffer;
@@ -844,7 +949,7 @@ void postFlightStateLoop() {
         prevTime = 0;
         prevAcc = 0.0; // f/sec2
         prevVelocity = 0;
-        bleRadio.println("AT+BLEUARTTX=ST:READY");
+        //bleRadio.println("AT+BLEUARTTX=ST:READY");
         logActivity("EVENT", "READY");
         sent = false;
       }
@@ -929,6 +1034,8 @@ void logData(uint32_t time) {
   logData += ",";
   logData += altitude;
   logData += ",";
+  logData += accelHighG.getX_Accel();
+  logData += ",";
   logData += accelerometer_gyro.getXAxisAccel();
   logData += ",";
   logData += accelerometer_gyro.getYAxisAccel();
@@ -961,14 +1068,16 @@ void logData(uint32_t time) {
 }
 
 // ======================= readAltimeterData ================================
-// Reads the altimeter data and computes the altitude above ground level
+// Reads the altimeter data
+// Return: An error code reflecting the result of the altimeter read. A value
+//         of 0 indicates no error during the read operation.
 // ==========================================================================
-void readAltimeterData() {
-  altimeterErrorCode = altimeter.readSensorData();
-  if (altimeterErrorCode != 0) {
+int8_t readAltimeterData() {
+  int8_t errorCode = altimeter.readSensorData();
+  if (errorCode != 0) {
       
 #ifdef DEBUG
-    printAltimeterError("Error reading altimeter sensor data: ", altimeterErrorCode);
+    printAltimeterError("Error reading altimeter sensor data: ", errorCode);
 #endif
       
   temperature = -100;
@@ -977,25 +1086,24 @@ void readAltimeterData() {
   } else {
     temperature = altimeter.getTemperature();
     pressure = altimeter.getPressure() / 100.0;
-    altitude = ((altimeter.getAltitude(SEALEVELPRESSURE)) * METERS_TO_FEET) - baseAltitude;
+    altitude = (altimeter.getAltitude(SEALEVELPRESSURE));
   }
+  return errorCode;
 }
 
 // ============================ openDataFile ================================
 // Opens the data log file. Creates a unique file name based upon the current
-// date and time as read from the Real Time Clock.
+// date and time (GMT) as read from the GPS. YYMMDDMM.txt
 // ==========================================================================
 void openDataFile() {
   // Make sure the file has not already been opened
   if (!dataFileOpen) {
-    // Read the date/time from the real time clock to create a unique log file name
-    DateTime now = realTimeClock.now();
     String dataFileName = "";
-    dataFileName += now.year();
+    dataFileName += gps.year;
     dataFileName.remove(0, 2);
-    dataFileName += now.month();
-    dataFileName += now.day();
-    dataFileName += now.minute();
+    dataFileName += gps.month;
+    dataFileName += gps.day;
+    dataFileName += gps.minute;
     dataFileName += ".txt";
 #ifdef DEBUG
     Serial.print("Log file name: ");
@@ -1031,13 +1139,13 @@ double readBatteryVoltage(void) {
 // ==========================================================================
 void displayBatteryLevel(void) {
   if (lipoBatteryVoltage >= BAT_VOLT_FULL) {
-    bleRadio.println("AT+BLEUARTTX=BT:FULL");
+    //bleRadio.println("AT+BLEUARTTX=BT:FULL");
   } else if (lipoBatteryVoltage >= BAT_VOLT_OK) {
-    bleRadio.println("AT+BLEUARTTX=BT:OK");
+    //bleRadio.println("AT+BLEUARTTX=BT:OK");
   } else if (lipoBatteryVoltage >= BAT_VOLT_LOW) {
-    bleRadio.println("AT+BLEUARTTX=BT:LOW");
+    //bleRadio.println("AT+BLEUARTTX=BT:LOW");
   } else {
-    bleRadio.println("AT+BLEUARTTX=BT:CRITICAL");
+    //bleRadio.println("AT+BLEUARTTX=BT:CRITICAL");
   }
   
 }
@@ -1047,23 +1155,20 @@ void displayBatteryLevel(void) {
 // ==========================================================================
 void logActivity(String type, String logEntry) {
   
-  // Get the date/time
-  DateTime now = realTimeClock.now();
   // Compose the log string
- 
   String logString = "";
   
-  logString += now.year();
+  logString += gps.year;
   logString += "-";
-  logString += now.month();
+  logString += gps.month;
   logString += "-";
-  logString += now.day();
+  logString += gps.day;
   logString +="T";
-  logString += now.hour();
+  logString += gps.hour;
   logString += ":";
-  logString += now.minute();
+  logString += gps.minute;
   logString += ":";
-  logString += now.second();
+  logString += gps.seconds;
   logString += "PST|";
   logString += type;
   logString += "|";
@@ -1107,7 +1212,7 @@ void flashLED(uint16_t pulsePeriod) {
     pwCounter++;
   }
   
-  if (ppCounter >= (pulsePeriod / TC3_INT_PERIOD)) {
+  if (ppCounter >= (pulsePeriod / TC5_INT_PERIOD)) {
     // Time to start an LED pulse
     // Restart both counters
     ppCounter = 0;
@@ -1118,7 +1223,7 @@ void flashLED(uint16_t pulsePeriod) {
     LED_On = true;
   }
 
-  if (LED_On && pwCounter >= (LED_PULSE_WIDTH / TC3_INT_PERIOD)) {
+  if (LED_On && pwCounter >= (LED_PULSE_WIDTH / TC5_INT_PERIOD)) {
     // Time to stop the LED pulse
     // Reset the pwCounter
     pwCounter = 0;
@@ -1145,27 +1250,6 @@ bool isLaunched() {
   } else {
     return false;
   }
-}
-
-// ==================== computeLaunchPointAlt =========================
-// Reads the barometric pressure and altitude and computes the launc
-// point altitude in feet. Log the base altitude.
-// ====================================================================
-uint8_t computeLaunchPointAlt() {
-  altimeterErrorCode = altimeter.readSensorData();
-  if (altimeterErrorCode = 0) {
-    pressure = altimeter.getPressure() / 100.0;
-    baseAltitude = (altimeter.getAltitude(SEALEVELPRESSURE)) * METERS_TO_FEET;
-    String logString = "Base Altitude: ";
-    logString +=  baseAltitude;
-    logActivity("STATUS", logString);
-#ifdef DEBUG
-    Serial.print("Base Altitude: ");
-    Serial.println(baseAltitude);
-#endif
-  }
-
-  return altimeterErrorCode;
 }
 
 // ==================== postFlightDataLog =========================
@@ -1212,7 +1296,7 @@ double velocityCalculator(uint32_t currentTime, double currentAcc) {
  double avgAcc = (prevAcc + scaledAcc) / 2;
 
  if (prevTime == 0) {
-  timeInterval = (double)TC3_INT_PERIOD;
+  timeInterval = (double)TC5_INT_PERIOD;
  } else {
   timeInterval = (double)currentTime - (double)prevTime;
  }
@@ -1235,7 +1319,7 @@ double velocityCalculator(uint32_t currentTime, double currentAcc) {
 
 // ==================== computeAverageAcceleration ===================
 // Calculates the running average of the measured acceleration over
-// 5 samples. Used to compute the average earth acceleration prior to 
+// 10 samples. Used to compute the average earth acceleration prior to 
 // launch.
 // ===================================================================
 void computeAverageAcceleration() {
@@ -1260,8 +1344,10 @@ void computeAverageAcceleration() {
   // Save the result to the global variable
   earthAccelerationMeasAvg = accelSum / 10.0;
 
+#ifdef DEBUG
   Serial.print("Average Earth Accel: ");
   Serial.println(earthAccelerationMeasAvg);
+#endif
   }
 
   
@@ -1281,9 +1367,46 @@ void checkGPS() {
 #endif
 
   if (gps.newNMEAreceived()) {
+#ifdef DEBUG
     Serial.print(gps.lastNMEA());
+#endif
     if (!gps.parse(gps.lastNMEA())) {
-      return;
+#ifdef DEBUG
+      //Serial.println("Failed to parse GPS sentence");
     }
+#endif
   }
+}
+
+// ======================== atApogee =================================
+// Checks if the rocket has reached apogee (highest point)
+// Return:  True if apogee is detected. False otherwise.
+// ===================================================================
+bool atApogee() {
+  // Check for low altitude apogee
+  if((maxAltitude < (75.0 + launchPointAlt)) && (altitude < (maxAltitude - 1))) {
+      return true;
+  }
+  // Check for high altitude apogee
+    if((maxAltitude >= (75.0 + launchPointAlt)) && (altitude < (maxAltitude - 10))) {
+      return true;
+    }
+    return false;
+  }
+
+// ======================== isLanded =================================
+// Checks if the rocket has landed
+// Return:  True if a landing is detected. False otherwise.
+// ===================================================================
+bool isLanded() {
+  if ((accelerometer_gyro.getXAxisRate() < NO_MOTION_UPPER) &&
+          (accelerometer_gyro.getXAxisRate() > NO_MOTION_LOWER) && 
+          (accelerometer_gyro.getYAxisRate() < NO_MOTION_UPPER) &&
+          (accelerometer_gyro.getYAxisRate() > NO_MOTION_LOWER) &&
+          (accelerometer_gyro.getZAxisRate() < NO_MOTION_UPPER) && 
+          (accelerometer_gyro.getZAxisRate() > NO_MOTION_LOWER)) {
+            return true;
+          } else {
+            return false;
+          }
 }
