@@ -1,4 +1,4 @@
- // UpGoer5Instrumentation
+// UpGoer5Instrumentation (Green)
 // Version: Beta 7
 // Author: Bob Parker
 // Date: 9/2/2023
@@ -63,8 +63,6 @@
 #include <LSM6DSO32.h>                // LSM6DSO32 sensor library code
 #include "wiring_private.h"           // pinPeripheral() function
 #include "RTClib.h"                   // Real Time Clock library by Adafruit
-#include "Adafruit_BLE.h"             // Bluetooth link library
-#include "Adafruit_BluefruitLE_SPI.h" // SPI library for bluetooth module
 #include <RWP_GPS.h>                  // GPS Library
 #include <RH_RF95.h>                  // Radio Head driver class
 #include <H3LIS331.hpp>               // H3LIS331 sensor library code
@@ -72,11 +70,12 @@
 
 // ===============================  Constants  =====================================
 #define DEBUG // Uncomment to enable debug comments printed to the console
+//#define GPS_DEBUG // Uncomment to enable printing GPS NMEA senstences
 //#define PRINT_LOG_DATA  // Uncomment to enable printing of log data to the console
 #define GPSSerial Serial1
 #define GPSECHO false
 
-const String VERSION = "Beta 7.01";
+const String VERSION = "Beta 7.1";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -88,9 +87,6 @@ const uint8_t LED = 13;
 const uint8_t RADIO_SPI_CS = 8;
 const uint8_t RADIO_SPI_IRQ = 3;
 const uint8_t RFM95_RST = 4;
-const uint8_t BLUEFRUIT_SPI_CS = 8;
-const uint8_t BLUEFRUIT_SPI_IRQ = 7;
-const uint8_t BLUEFRUIT_SPI_RST = 4;
 const uint8_t SENSOR_SPI_CLK = 12;
 const uint8_t SENSOR_SPI_MOSI = 10;
 const uint8_t SENSOR_SPI_MISO = 11;
@@ -123,6 +119,7 @@ const double GRAVITY_ACC = 32.174;          // The acceleration on the surface o
 const uint8_t CLIENT_ADDRESS = 2;
 const uint8_t SERVER_ADDRESS = 1;
 const double RF95_FREQ = 915.0;
+const uint8_t MAX_MESSAGE_LENGTH = 20;    // Maximum radio message length
 
 
 enum states {START_UP, FAULT, READY, ARMED, LOGGING, POST_FLIGHT};
@@ -137,8 +134,7 @@ BMP3XX altimeter;  // Altimeter sensor object instance
 LSM6DSO32 accelerometer_gyro;  //Accelerometer/Gyro sensor object instance
 H3LIS331 accelHighG;          // H3LIS331 high accelerometer object instance
 RTC_PCF8523 realTimeClock;
-RH_RF95 radioDriver; // LoRa radio driver object
-//Adafruit_BluefruitLE_SPI bleRadio(BLUEFRUIT_SPI_CS, BLUEFRUIT_SPI_IRQ, BLUEFRUIT_SPI_RST);
+RH_RF95 radioDriver = RH_RF95(RADIO_SPI_CS, RADIO_SPI_IRQ); // LoRa radio driver object
 Adafruit_GPS gps(&GPSSerial);
 
 double temperature = 0.0;       // Temperature in degrees C
@@ -166,9 +162,10 @@ double prevVelocity = 0;
 bool GPS_FIX = false;
 double launchPointLat;
 double launchPointLon;
-double launchPointAlt;          // Altitude above MSL in meters
-double baroAltitudeError;       // Difference between baro computed alt and GPS alt
-int16_t packetnum = 0;          // packet counter, we increment per xmission
+double launchPointAlt;           // Altitude above MSL in meters
+double baroAltitudeError;        // Difference between baro computed alt and GPS alt
+char buffer[MAX_MESSAGE_LENGTH]; // Message buffer
+char radioPacket[20];            // Buffer containing radio message
 
 // =======================  TC5 Interrupt Handler  ===================================
 // TC5 will generate an interrupt at a rate determined by TC5_INT_PERIOD to drive the 
@@ -236,7 +233,7 @@ void setup() {
 #ifdef DEBUG
     Serial.println("Failed to set LoRa radio frequency");
 #endif
-
+  }
   // Set the LoRa radio transmit power
   radioDriver.setTxPower(23, false);
 #ifdef DEBUG
@@ -268,41 +265,7 @@ void setup() {
     }
   } // End radio connect loop
 
-  }
-  // ======================== Bluetooth Radio Initialization =========================
-  /*
-#ifdef DEBUG
-  Serial.print(F("Initializing Bluetooth LE module: "));
-#endif
-  if (!bleRadio.begin(false)) {
-#ifdef DEBUG
-    Serial.println(F("Could not initialize Bluefruit LE module"));
-#endif
-  }
-#ifdef DEBUG
-  Serial.println(F("OK"));
-#endif
-  // Disable command echo
-  bleRadio.echo(false);
-  // Change LED activity mode
-  bleRadio.sendCommandCheckOK("AT+HWModeLED=MODE");
-
-  // Wait for bluetooth radio connection
-  while (!bleRadio.isConnected()) {
-    delay(500);
-  }
-
-  delay(1000);
-
-  bleRadio.println("AT+BLEUARTTX=ST:INITIALIZING");
-  delay(20);
-
-
-#ifdef DEBUG
-  Serial.println(F("Bluetooth link connected"));
-#endif
-*/
-  
+  delay(500);
 
   // ======================  Initialize the Sensor SPI Bus  ============================
   sensorSPI.begin();
@@ -312,8 +275,7 @@ void setup() {
   pinPeripheral(10, PIO_SERCOM);
   pinPeripheral(11, PIO_SERCOM);
   pinPeripheral(12, PIO_SERCOM);
-  //bleRadio.println("AT+BLEUARTTX=MS:Sensor SPI Init");
-  delay(20);
+  sendRadioMessageNoAck("MS:Sensor SPI Init");
 
   // ============================ SD Card Library Setup ================================
   
@@ -321,17 +283,16 @@ void setup() {
 #ifdef DEBUG
     Serial.println("SD card failed to initialize");
 #endif
-    //bleRadio.println("AT+BLEUARTTX=ER:SD Card Init");
+    sendRadioMessageNoAck("ER:SD Card Init");
     delay(20);
-    //bleRadio.println("AT+BLEUARTTX=ST:ERROR");
+    sendRadioMessageAckRetry("ST:ERROR", 3);
     delay(20);
     while(1); // Hang here
   } else {
 #ifdef DEBUG
     Serial.println("SD card initialized");
 #endif
-    //bleRadio.println("AT+BLEUARTTX=MS:SD Card Init");
-    delay(20);
+    sendRadioMessageNoAck("MS:SD Card Init");
   }
 
   // ======================  SAMD21 Generic Clock Setup  ====================
@@ -353,8 +314,7 @@ void setup() {
 #ifdef DEBUG
   Serial.println("Generic clock initialized");
 #endif
-  //bleRadio.println("AT+BLEUARTTX=MS:GCLK 6 Init");
-  delay(20);
+  sendRadioMessageNoAck("MS:GCLK 6 Init");
 
   // =============================  TC5 Setup  ==============================
   // TC5 is used to generate a periodic interrupt to drive all activity.
@@ -390,9 +350,7 @@ void setup() {
 #ifdef DEBUG
   Serial.println("TC5 initialized");
 #endif
-
-  //bleRadio.println("AT+BLEUARTTX=MS:TC5 Init");
-  delay(20);
+  sendRadioMessageNoAck("MS:TC5 Init");
 
   // =============================== ADC Setup ==========================
   // The ADC is used to measure the LiPo battery voltage level
@@ -409,9 +367,7 @@ void setup() {
 #ifdef DEBUG
   Serial.println("ADC initialized");
 #endif
-
-  //bleRadio.println("AT+BLEUARTTX=MS:ADC Init");
-  delay(20);
+  sendRadioMessageNoAck("MS:ADC Init");
 
   // ====================== GPS Setup  ==================================
 
@@ -436,6 +392,8 @@ void setup() {
     delay(10);
   }
 
+  sendRadioMessageNoAck("MS:GPS Fix");
+
 
   // ===================== LSM6DSO32 Sensor Setup =======================
   // The LSM6DSO32 is a combined accelerometer and gyro. It is used to 
@@ -453,11 +411,9 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the accelerometer/gyro sensor");
-    //bleRadio.println("AT+BLEUARTTX=ER:LSM6DS032 Error");
-    delay(20);
+    sendRadioMessageNoAck("ER:LSM6DS032 Error");
   } else {
-    //bleRadio.println("AT+BLEUARTTX=MS:LSM6DS032 Init");
-    delay(20);
+    sendRadioMessageNoAck("MS:LSM6DS032 Init");
 #ifdef DEBUG
     Serial.println("Accelerometer/Gyro sensor initilaized");
 #endif
@@ -487,11 +443,9 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the H3LIS331 accelerometer sensor");
-    //bleRadio.println("AT+BLEUARTTX=ER:H3LIS331 Error");
-    delay(20);
+    sendRadioMessageNoAck("ER:H3LIS331 Error");
   } else {
-    //bleRadio.println("AT+BLEUARTTX=MS:H3LIS331 Init");
-    delay(20);
+    sendRadioMessageNoAck("MS:H3LIS331 Init");
 #ifdef DEBUG
     Serial.println("H3LIS331 accelerometer sensor initilaized");
 #endif
@@ -519,7 +473,7 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the altimeter sensor");
-    //bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
+    sendRadioMessageNoAck("ER:BMP390 Error");
   } else {
 #ifdef DEBUG
     Serial.println("Altimeter sensor initialized");
@@ -546,8 +500,7 @@ void setup() {
     printAltimeterError("Error writing altimeter settings:", altimeterErrorCode);
 #endif
     logActivity("ERROR", "Error writing altimeter settings");
-    //bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
-    delay(20);
+    sendRadioMessageNoAck("ER:BMP390 Error");
     state = FAULT;
   }
 
@@ -563,14 +516,12 @@ void setup() {
     printAltimeterError("Error writing altimeter power mode:", altimeterErrorCode);
 #endif
     logActivity("ERROR", "Error writing altimeter power mode");
-    //bleRadio.println("AT+BLEUARTTX=ER:BMP390 Error");
-    delay(20);
+    sendRadioMessageNoAck("ER:BMP390 Error");
     state = FAULT;
   }
 
   logActivity("STATUS", "Altimeter settings and power mode initialized");
-  //bleRadio.println(F("AT+BLEUARTTX=MS:BMP390 Init"));
-  delay(20);
+  sendRadioMessageNoAck("MS:BMP390 Init");
 
 
   // ======================= Ready State Check ===========================
@@ -579,7 +530,15 @@ void setup() {
   if (state != FAULT) {
     state = READY;
     logActivity("EVENT", "Transition to Ready state");
-    //bleRadio.println(F("AT+BLEUARTTX=ST:READY"));
+    if (!sendRadioMessageAckRetry("ST:READY", 3)) {
+      // The message was not confirmed as sent
+#ifdef DEBUG
+      Serial.println("Ready state transition not acknowledged");
+#endif
+      state = FAULT;
+      logActivity("ERROR", "Ready state transition not acknowledged");
+    }
+    
   }
 
   // Enable TC5. We will start getting TC5 interrupts at the TC5_INT_PERIOD
@@ -644,69 +603,16 @@ void faultStateLoop() {
 void readyStateLoop() {
   static uint16_t counter = 0;  // Used to compute when a battery check is needed
 
+  // Read the new sensor data
   accelerometer_gyro.readSensorData();
 
   // Read GPS NMEA sentences and update GPS data values
   checkGPS();
   
   // Check for an ARM event every time through the loop
-  //bleRadio.println("AT+BLEUARTRX");
-  //bleRadio.readline();
-  if (!strcmp(bleRadio.buffer, "OK") == 0) {
-    // Some data was received
-    String message = bleRadio.buffer;
-    message.toLowerCase();
-    if (strcmp(message.c_str(), "arm") == 0) {
-      if (accelerometer_gyro.getXAxisAccel() > 0.9) {
-        // Arm command received
-      state = ARMED;
-      //bleRadio.println("AT+BLEUARTTX=ST:ARMED");
-      logActivity("EVENT", "Armed");
+  checkArmCommand();
 
-      // Save the launch point location info and compute altitude error term
-      launchPointLat = gps.latitude;
-      launchPointLon = gps.longitude;
-      launchPointAlt = gps.altitude;
-      maxAltitude = launchPointAlt;     // Initialize the maximum achieved altitude
-      if (readAltimeterData()) {
-        //Failed to read altimeter data
-        state = FAULT;
-#ifdef DEBUG
-        Serial.println("Error reading altimeter while arming");
-#endif
-        //bleRadio.println("AT+BLEUARTTX=ST:FAULT");
-        return;
-      }
-      baroAltitudeError = altitude - launchPointAlt;
-      
-      // Write the header row to the log file with labels for the data
-      // File name to include the date from the Real Time Clock
-      // Leave the file open. It will be closed later after all data is logged
-      String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
-                          "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
-      openDataFile();
-      // Write the header string to the data file
-      if (dataFile) {
-        dataFile.println(headerRow);
-        // Leave the log file open to save time during logging of sensor readings
-      } else {
-        logActivity("ERROR", "SD Card write error");
-        //bleRadio.println("AT+BLEUARTTX=ER:SD Card Write");
-    
-#ifdef DEBUG
-        Serial.println("SD card write error");
-#endif
-      }
-      
-      } else {
-        //bleRadio.println("AT+BLEUARTTX=ER:Not Vertical");
-      }
-    } else {
-      //bleRadio.println("AT+BLEUARTTX=MS:Expected arm cmd");
-    }
-  }
-
-  // Check battery voltage and report via bluetooth radio
+  // Check battery voltage and report via radio
   counter++;
   if (counter >= (BAT_MEAS_PER / TC5_INT_PERIOD)) {
     counter = 0;  // Reset the counter
@@ -728,9 +634,8 @@ void readyStateLoop() {
     if (lipoBatteryVoltage < BAT_VOLT_LOW) {
       state = FAULT;
       logActivity("ERROR", "Battery voltage low");
-      //bleRadio.println("AT+BLEUARTTX=MS:Battery Low");
-      delay(20);
-      //bleRadio.println("AT+BLEUARTTX=ST:ERROR");
+      sendRadioMessageNoAck("MS:Battery Low");
+      sendRadioMessageAckRetry("ST:ERROR", 3);
     }
   }
 }
@@ -753,18 +658,12 @@ void armedStateLoop() {
   checkGPS();
   
   // Check for a DISARM event every time through the loop
-  //bleRadio.println("AT+BLEUARTRX");
-  //bleRadio.readline();
-  if (!strcmp(bleRadio.buffer, "OK") == 0) {
-    // Some data was received
-    if (strcmp(bleRadio.buffer, "disarm") == 0) {
-      // We are disarmed
-      state = READY;
-      //bleRadio.println("AT+BLEUARTTX=ST:READY");
-      logActivity("EVENT", "Disarmed");
-      closeDataFile();
-      digitalWrite(LED, LOW);
-    }
+  if (checkRadioMessage("disarm")) {
+    state = READY;
+    sendRadioMessageAckRetry("ST:READY", 3);
+    logActivity("EVENT", "Disarmed");
+    closeDataFile();
+    digitalWrite(LED, LOW);
   }
 
   // Check for launch by reading the accelerometer
@@ -781,7 +680,7 @@ void armedStateLoop() {
     state = LOGGING;
     digitalWrite(LED, LOW); // Make sure the on-board LED is off
     logActivity("EVENT", "Launch");
-    //bleRadio.println("AT+BLEUARTTX=ST:LAUNCHED");
+    sendRadioMessageNoAck("ST:LAUNCHED");
     return;
   }
   
@@ -875,7 +774,7 @@ timeOutCounter++;
   if (isLanded) {
     state = POST_FLIGHT;
     postFlightDataLog("LANDED");
-    //bleRadio.println("AT+BLEUARTTX=ST:LANDED");
+    sendRadioMessageAckRetry("ST:LANDED", 60);
   }
       
 
@@ -883,7 +782,7 @@ timeOutCounter++;
   if (timeOutCounter * TC5_INT_PERIOD > TIME_OUT * 1000) {
     state = POST_FLIGHT;
     postFlightDataLog("TIMEOUT");
-    //bleRadio.println("AT+BLEUARTTX=ST:LANDED");
+    sendRadioMessageAckRetry("ST:LANDED", 60);
     timeOutCounter = 0;
   }
 
@@ -907,53 +806,56 @@ timeOutCounter++;
 // ==========================================================================
 void postFlightStateLoop() {
   static bool sent = false;
+  static bool connected = false;
+  
   flashLED(LED_PPS_POST_FLIGHT);
-  if (bleRadio.isConnected() && sent != true) {
+
+  // Check for an incoming "connect" radio message
+  if (checkRadioMessage("connect")) {
+    sendRadioMessageNoAck("connect");
+    connected = true;
+  }
+
+  if (connected && !sent) {
     delay(5000);
 
-    String dataString = "AT+BLEUARTTX=AL:";
+    String dataString = "AL:";
     dataString += String(maxAltitude);
-    //bleRadio.println(dataString);
+    sendRadioMessageAckRetry(dataString.c_str(), 3);
     delay(20);
     
-    dataString = "AT+BLEUARTTX=AC:";
+    dataString = "AC:";
     dataString += String(maxAcceleration);
-    //bleRadio.println(dataString);
+    sendRadioMessageAckRetry(dataString.c_str(), 3);
     delay(20);
 
-    dataString = "AT+BLEUARTTX=DU:";
+    dataString = "DU:";
     dataString += String(flightLength);
-    //bleRadio.println(dataString);
+    sendRadioMessageAckRetry(dataString.c_str(), 3);
     delay(20);
 
-
-    //bleRadio.println("AT+BLEUARTTX=AT:AGAIN");
+    sendRadioMessageNoAck("AT:AGAIN");
     delay(20);
 
     
     sent = true;
   }
-  //bleRadio.println("AT+BLEUARTRX");
-  //bleRadio.readline();
-    if (!strcmp(bleRadio.buffer, "OK") == 0) {
-      // Some data was received
-      String launchAgain = bleRadio.buffer;
-      launchAgain.toLowerCase();
-      if (strcmp(launchAgain.c_str(), "yes") == 0) {
-        // Launch again command received
-        state = READY;
-        maxAltitude = 0;
-        maxAcceleration = 0;
-        maxVelocity = 0;
-        flightLength = 0;
-        prevTime = 0;
-        prevAcc = 0.0; // f/sec2
-        prevVelocity = 0;
-        //bleRadio.println("AT+BLEUARTTX=ST:READY");
-        logActivity("EVENT", "READY");
-        sent = false;
-      }
-    }
+
+  // Check for the "again" message
+  if (checkRadioMessage("again")) {
+    state = READY;
+    maxAltitude = 0;
+    maxAcceleration = 0;
+    maxVelocity = 0;
+    flightLength = 0;
+    prevTime = 0;
+    prevAcc = 0.0; // f/sec2
+    prevVelocity = 0;
+    logActivity("EVENT", "READY");
+    sent = false;
+    connected = false;
+    sendRadioMessageAckRetry("ST:READY", 3);
+  }
 }
 
 
@@ -1139,13 +1041,13 @@ double readBatteryVoltage(void) {
 // ==========================================================================
 void displayBatteryLevel(void) {
   if (lipoBatteryVoltage >= BAT_VOLT_FULL) {
-    //bleRadio.println("AT+BLEUARTTX=BT:FULL");
+    sendRadioMessageNoAck("BT:FULL");
   } else if (lipoBatteryVoltage >= BAT_VOLT_OK) {
-    //bleRadio.println("AT+BLEUARTTX=BT:OK");
+    sendRadioMessageNoAck("BT:OK");
   } else if (lipoBatteryVoltage >= BAT_VOLT_LOW) {
-    //bleRadio.println("AT+BLEUARTTX=BT:LOW");
+    sendRadioMessageNoAck("BT:LOW");
   } else {
-    //bleRadio.println("AT+BLEUARTTX=BT:CRITICAL");
+    sendRadioMessageNoAck("BT:CRITICAL");
   }
   
 }
@@ -1174,7 +1076,7 @@ void logActivity(String type, String logEntry) {
   logString += "|";
   logString += logEntry;
   
-#ifdef DEBUG
+#ifdef PRINT_LOG_DATA
   Serial.println(logString);
 #endif
 
@@ -1360,21 +1262,22 @@ void checkGPS() {
   // Read data from the GPS
   char c = gps.read();
   
-#ifdef DEBUG
+#ifdef GPS_DEBUG
   if (c) {
     Serial.print(c);
   }
 #endif
 
   if (gps.newNMEAreceived()) {
-#ifdef DEBUG
+#ifdef GPS_DEBUG
     Serial.print(gps.lastNMEA());
 #endif
     if (!gps.parse(gps.lastNMEA())) {
-#ifdef DEBUG
-      //Serial.println("Failed to parse GPS sentence");
-    }
+#ifdef GPS_DEBUG
+      Serial.println("Failed to parse GPS sentence");
 #endif
+    }
+
   }
 }
 
@@ -1409,4 +1312,185 @@ bool isLanded() {
           } else {
             return false;
           }
+}
+
+//=================== sendRadioMessageNoAck ======================
+// Sends a radio message with no acknowledment required.
+// Parameters:
+//  message:  The radio message that is to be sent
+// Return: None
+//=================================================================
+void sendRadioMessageNoAck(const char * message) {
+  strncpy(radioPacket, message, sizeof(radioPacket));
+  radioDriver.send((uint8_t *)radioPacket, sizeof(radioPacket));
+  delay(10);
+
+#ifdef DEBUG
+  Serial.print("Radio message sent: ");
+  Serial.println(message);
+#endif
+  // Block here until the packet has been sent
+  radioDriver.waitPacketSent();
+  delay(200);
+}
+
+
+//=================== sendRadioMessageAckRetry ====================
+// Sends a radio message with acknowledment required. Resends the
+// message if no acknowledgment is received.
+// Parameters:
+//  message:  The radio message that is to be sent
+//  retries:  The number of times that the message will be resent
+// Return: True if a acknowledment was received
+//=================================================================
+bool sendRadioMessageAckRetry(const char * message, uint8_t retries) {
+  strncpy(radioPacket, message, sizeof(radioPacket));
+
+  uint8_t attempt = 0;
+  while (attempt <= retries) {
+    // Send the message
+    radioDriver.send((uint8_t *)radioPacket, sizeof(radioPacket));
+    delay(10);
+    radioDriver.waitPacketSent();
+
+    // Listen for an acknowledgment
+    uint8_t length;
+    if (radioDriver.waitAvailableTimeout(1000)) {
+      if (radioDriver.recv((uint8_t *)buffer, &length)) {
+        if (length != 0) {
+          if (!strncmp(buffer, message, sizeof(message))) {
+            return true;
+          }
+        }
+      }
+    } // End listen for acknowledgement
+
+    // Try again
+    attempt++;
+  } // End while loop
+
+  return false;
+  
+}
+
+
+//======================= checkRadioMessage =======================
+// Checks if the specified radio message has been received.
+// Parameters:
+//  message:  The radio message to check for
+// Return: True if the message was received
+//=================================================================
+bool checkRadioMessage(const char * message) {
+  uint8_t messageLength;
+  char messageBuffer[MAX_MESSAGE_LENGTH];
+  
+  if (radioDriver.available()) {
+    if (radioDriver.recv((uint8_t *)messageBuffer, &messageLength)) {
+      if (messageLength != 0) {
+        if (!strncmp(messageBuffer, message, sizeof(message))) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+
+//======================= getLaunchPointFix =======================
+// Reads, saves, and logs the current GPS latitude, longitude, and 
+// altitude data. Computes the baro altitude error  assuming GPS 
+// altitude is truth.
+// Parameters: None
+// Return: True if the baro altitude was read successfully
+//=================================================================
+bool getLaunchPointFix() {
+  // Save the GPS location data
+  launchPointLat = gps.latitude;
+  launchPointLon = gps.longitude;
+  launchPointAlt = gps.altitude;
+
+  // Log the GPS location data
+  String logString = "Launch Point Latitude: ";
+  logString += launchPointLat;
+  logActivity("STATUS", logString);
+  logString = "Launch Point Longitude: ";
+  logString += launchPointLon;
+  logActivity("STATUS", logString);
+  logString = "Launch Point Altitude: ";
+  logString += launchPointAlt;
+  logActivity("STATUS", logString);
+
+  // Initialize maximum altitude
+  maxAltitude = launchPointAlt;
+
+  // Compute the bara altitude error
+  if (!(readAltimeterData() == 0)) {
+    //Failed to read altimeter data
+    return false;
+    }
+    
+  baroAltitudeError = altitude - launchPointAlt;
+
+  return true;
+}
+
+
+//======================= checkArmCommand =========================
+// Checks for a valid arm command from the ground station. Validity
+// check includes checking if the rocket is vertical, checking
+// that the arm command could be acknowledged, the launch point
+// baro altitude error could be computed, and the data file could
+// be opened. If an error is detected then the state is changed to
+// FAULT.
+// Parameters: None
+// Return: None
+//=================================================================
+void checkArmCommand() {
+  if (checkRadioMessage("arm")) {
+    if (accelerometer_gyro.getXAxisAccel() > 0.9) {
+
+      // Acknowledge receipt of the arm command
+      if (sendRadioMessageAckRetry("ST:ARMED", 3)) {
+        state = ARMED;
+        logActivity("Event", "Armed");
+#ifdef DEBUG
+        Serial.println("Arm command received and acknowledged");
+#endif
+        // Get GPS fix of launch point & compute baro altitude error
+        if (!getLaunchPointFix()) {
+          state = FAULT;
+          sendRadioMessageAckRetry("ST:FAULT", 3);
+#ifdef DEBUG
+          Serial.println("Error reading altimeter while arming");
+#endif
+        }
+        // Open data file in preparation for data logging
+        openDataFile();
+        if (dataFile) {
+          String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
+                             "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
+          dataFile.println(headerRow);
+        } else {
+          // Data file could not be opened
+          logActivity("ERROR", "SD Card write error");
+          sendRadioMessageNoAck("ER:SD Card Write");
+#ifdef DEBUG
+          Serial.println("SD card write error");
+#endif
+        }
+      } else {
+        // Could not acknowledge arm command
+        sendRadioMessageAckRetry("ST:READY", 3);
+#ifdef DEBUG
+        Serial.println("Could not acknowledge arm command");
+#endif  
+      }
+
+    } else { 
+      // The rocket is not vertical
+      delay(200);
+      sendRadioMessageNoAck("ER:Not Vertical");
+    } // End check if rocket is vertical
+  } // End checkRadioMessage
 }
