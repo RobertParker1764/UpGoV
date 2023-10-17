@@ -82,7 +82,7 @@ const uint8_t BMP390_CS = 5;
 const uint8_t LSM6DSO32_CS = 6;
 const uint8_t SD_CARD_CS = A5;
 const uint8_t H3LIS331_CS = SDA;
-const uint8_t GPS_ENABLE = SCL;
+const uint8_t GPS_ENABLE = A4;
 const uint8_t LED = 13;
 const uint8_t RADIO_SPI_CS = 8;
 const uint8_t RADIO_SPI_IRQ = 3;
@@ -92,10 +92,10 @@ const uint8_t SENSOR_SPI_MOSI = 10;
 const uint8_t SENSOR_SPI_MISO = 11;
 const uint8_t BATTERY_MONITOR = 9;
 const uint8_t INFLIGHT_EVENT_BATTERY_MONITOR = A0;
-const uint8_t INFLIGHT_EVENT_1 = A1;
-const uint8_t INFLIGHT_EVENT_2 = A2;
-const uint8_t INFLIGHT_EVENT_3 = A3;
-const uint8_t INFLIGHT_EVENT_4 = A4;
+const uint8_t INFLIGHT_EVENT_1 = SCL;
+const uint8_t INFLIGHT_EVENT_2 = A3;
+const uint8_t INFLIGHT_EVENT_3 = A2;
+const uint8_t INFLIGHT_EVENT_4 = A1;
 
 // Other Constants
 const uint8_t TC5_INT_PERIOD = 10;          // RTC interrupt period in milliseconds
@@ -382,8 +382,8 @@ void setup() {
   while (!GPS_FIX) {
     //Check for a new NMEA sentence and parse the results if received
     checkGPS();
-    //if (gps.fix) {
-    if (true) {
+    if (gps.fix) {
+    //if (true) {
       GPS_FIX = true;
 #ifdef DEBUG
       Serial.println("GPS Fix");
