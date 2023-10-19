@@ -771,7 +771,7 @@ timeOutCounter++;
   }
 
   // Check if we have landed (no more motion)
-  if (isLanded) {
+  if (isLanded()) {
     state = POST_FLIGHT;
     postFlightDataLog("LANDED");
     sendRadioMessageAckRetry("ST:LANDED", 60);
