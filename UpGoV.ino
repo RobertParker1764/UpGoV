@@ -64,7 +64,8 @@
 #include "wiring_private.h"           // pinPeripheral() function
 #include "RTClib.h"                   // Real Time Clock library by Adafruit
 #include <RWP_GPS.h>                  // GPS Library
-#include <RH_RF95.h>                  // Radio Head driver class
+#include <RH_RF95.h>                  // Radio Head driver class for LoRa Radio
+#include <RHReliableDatagram.h>       // Radio Head manager class for reliable comms
 #include <H3LIS331.hpp>               // H3LIS331 sensor library code
 
 
@@ -120,6 +121,8 @@ const uint8_t CLIENT_ADDRESS = 2;
 const uint8_t SERVER_ADDRESS = 1;
 const double RF95_FREQ = 915.0;
 const uint8_t MAX_MESSAGE_LENGTH = 20;    // Maximum radio message length
+const uint8_t UPGOV_ADDR = 2;             // Radio address for UpGoV avionics package
+const uint8_t GROUND_STATION_ADDR = 1;    // Radio address for the Ground Station
 
 
 enum states {START_UP, FAULT, READY, ARMED, LOGGING, POST_FLIGHT};
@@ -135,6 +138,7 @@ LSM6DSO32 accelerometer_gyro;  //Accelerometer/Gyro sensor object instance
 H3LIS331 accelHighG;          // H3LIS331 high accelerometer object instance
 RTC_PCF8523 realTimeClock;
 RH_RF95 radioDriver = RH_RF95(RADIO_SPI_CS, RADIO_SPI_IRQ); // LoRa radio driver object
+RHReliableDatagram radioManager(radioDriver, UPGOV_ADDR);
 Adafruit_GPS gps(&GPSSerial);
 
 double temperature = 0.0;       // Temperature in degrees C
@@ -164,8 +168,9 @@ double launchPointLat;
 double launchPointLon;
 double launchPointAlt;           // Altitude above MSL in meters
 double baroAltitudeError;        // Difference between baro computed alt and GPS alt
-char buffer[MAX_MESSAGE_LENGTH]; // Message buffer
+uint8_t buffer[MAX_MESSAGE_LENGTH]; // Message buffer
 char radioPacket[20];            // Buffer containing radio message
+int radioError = 0;              // The number of radio messages not receiving an ack
 
 // =======================  TC5 Interrupt Handler  ===================================
 // TC5 will generate an interrupt at a rate determined by TC5_INT_PERIOD to drive the 
@@ -222,7 +227,7 @@ void setup() {
   delay(10);
 
   // Initialize the LoRa radio
-  if (!radioDriver.init()) {
+  if (!radioManager.init()) {
 #ifdef DEBUG
     Serial.println("Radio init() error");
 #endif
@@ -241,24 +246,35 @@ void setup() {
   Serial.println("Waiting for ground station connect");
 #endif
 
+  radioManager.setThisAddress(UPGOV_ADDR);
+
   // Block here until we connect to the UpGoV Ground Station
   bool connected = false;
+  uint8_t messageLength;
+  uint8_t from;
+  uint8_t to;
   while (!connected) {
-    if (radioDriver.available()) {
-      // Message received. Check for a connect message
-      char messageBuffer[RH_RF95_MAX_MESSAGE_LEN];
-      uint8_t messageLength = sizeof(messageBuffer);
-      if (radioDriver.recv((uint8_t *)messageBuffer, &messageLength)) {
-        // Check message length
-        if (messageLength != 0) {
-          if (!strncmp(messageBuffer, "connect", 7)) {
-            // Connect message received
-            connected = true;
-            // Send the reply
+    messageLength = sizeof(buffer);
+    if (radioManager.recvfromAck(buffer, &messageLength, &from, &to)) {
+      // Message received. Is it to us?
+      Serial.println("Radio message received");
+      if (to == UPGOV_ADDR) {
+        Serial.println("Radio message is addressed to us");
+        Serial.print("Radio message is from address: ");
+        Serial.println(from);
+        // The message is to us. Is it from the ground station?
+        if (from == GROUND_STATION_ADDR) {
+          Serial.println("Radio message is from the ground station");
+          // Message is from the ground station. Is it a connect message?
+          buffer[messageLength] = 0;  // Terminate with a null character
+          Serial.print("The message is: ");
+          Serial.println((char*)buffer);
+          if (!strncmp((char*)buffer, "connect", 7)) {
+            // Connect message received. Send connect message reply
             uint8_t data[] = "connect";
-            radioDriver.send(data, sizeof(data));
-            radioDriver.waitPacketSent();
-            
+            if (radioManager.sendtoWait(data, sizeof(data), GROUND_STATION_ADDR)) {
+              connected = true;
+            }
           }
         }
       }
@@ -275,7 +291,7 @@ void setup() {
   pinPeripheral(10, PIO_SERCOM);
   pinPeripheral(11, PIO_SERCOM);
   pinPeripheral(12, PIO_SERCOM);
-  sendRadioMessageNoAck("MS:Sensor SPI Init");
+  sendRadioMessage("MS:Sensor SPI Init", GROUND_STATION_ADDR);
 
   // ============================ SD Card Library Setup ================================
   
@@ -283,16 +299,16 @@ void setup() {
 #ifdef DEBUG
     Serial.println("SD card failed to initialize");
 #endif
-    sendRadioMessageNoAck("ER:SD Card Init");
+    sendRadioMessage("ER:SD Card Init", GROUND_STATION_ADDR);
     delay(20);
-    sendRadioMessageAckRetry("ST:ERROR", 3);
+    sendRadioMessage("ST:ERROR", GROUND_STATION_ADDR);
     delay(20);
     while(1); // Hang here
   } else {
 #ifdef DEBUG
     Serial.println("SD card initialized");
 #endif
-    sendRadioMessageNoAck("MS:SD Card Init");
+    sendRadioMessage("MS:SD Card Init", GROUND_STATION_ADDR);
   }
 
   // ======================  SAMD21 Generic Clock Setup  ====================
@@ -314,7 +330,7 @@ void setup() {
 #ifdef DEBUG
   Serial.println("Generic clock initialized");
 #endif
-  sendRadioMessageNoAck("MS:GCLK 6 Init");
+  sendRadioMessage("MS:GCLK 6 Init", GROUND_STATION_ADDR);
 
   // =============================  TC5 Setup  ==============================
   // TC5 is used to generate a periodic interrupt to drive all activity.
@@ -350,7 +366,7 @@ void setup() {
 #ifdef DEBUG
   Serial.println("TC5 initialized");
 #endif
-  sendRadioMessageNoAck("MS:TC5 Init");
+  sendRadioMessage("MS:TC5 Init", GROUND_STATION_ADDR);
 
   // =============================== ADC Setup ==========================
   // The ADC is used to measure the LiPo battery voltage level
@@ -367,7 +383,7 @@ void setup() {
 #ifdef DEBUG
   Serial.println("ADC initialized");
 #endif
-  sendRadioMessageNoAck("MS:ADC Init");
+  sendRadioMessage("MS:ADC Init", GROUND_STATION_ADDR);
 
   // ====================== GPS Setup  ==================================
 
@@ -392,7 +408,7 @@ void setup() {
     delay(10);
   }
 
-  sendRadioMessageNoAck("MS:GPS Fix");
+  sendRadioMessage("MS:GPS Fix", GROUND_STATION_ADDR);
 
 
   // ===================== LSM6DSO32 Sensor Setup =======================
@@ -411,9 +427,9 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the accelerometer/gyro sensor");
-    sendRadioMessageNoAck("ER:LSM6DS032 Error");
+    sendRadioMessage("ER:LSM6DS032 Error", GROUND_STATION_ADDR);
   } else {
-    sendRadioMessageNoAck("MS:LSM6DS032 Init");
+    sendRadioMessage("MS:LSM6DS032 Init", GROUND_STATION_ADDR);
 #ifdef DEBUG
     Serial.println("Accelerometer/Gyro sensor initilaized");
 #endif
@@ -443,9 +459,9 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the H3LIS331 accelerometer sensor");
-    sendRadioMessageNoAck("ER:H3LIS331 Error");
+    sendRadioMessage("ER:H3LIS331 Error", GROUND_STATION_ADDR);
   } else {
-    sendRadioMessageNoAck("MS:H3LIS331 Init");
+    sendRadioMessage("MS:H3LIS331 Init", GROUND_STATION_ADDR);
 #ifdef DEBUG
     Serial.println("H3LIS331 accelerometer sensor initilaized");
 #endif
@@ -473,7 +489,7 @@ void setup() {
 #endif
     state = FAULT;
     logActivity("ERROR", "Error initializing the altimeter sensor");
-    sendRadioMessageNoAck("ER:BMP390 Error");
+    sendRadioMessage("ER:BMP390 Error", GROUND_STATION_ADDR);
   } else {
 #ifdef DEBUG
     Serial.println("Altimeter sensor initialized");
@@ -500,7 +516,7 @@ void setup() {
     printAltimeterError("Error writing altimeter settings:", altimeterErrorCode);
 #endif
     logActivity("ERROR", "Error writing altimeter settings");
-    sendRadioMessageNoAck("ER:BMP390 Error");
+    sendRadioMessage("ER:BMP390 Error", GROUND_STATION_ADDR);
     state = FAULT;
   }
 
@@ -516,12 +532,12 @@ void setup() {
     printAltimeterError("Error writing altimeter power mode:", altimeterErrorCode);
 #endif
     logActivity("ERROR", "Error writing altimeter power mode");
-    sendRadioMessageNoAck("ER:BMP390 Error");
+    sendRadioMessage("ER:BMP390 Error", GROUND_STATION_ADDR);
     state = FAULT;
   }
 
   logActivity("STATUS", "Altimeter settings and power mode initialized");
-  sendRadioMessageNoAck("MS:BMP390 Init");
+  sendRadioMessage("MS:BMP390 Init", GROUND_STATION_ADDR);
 
 
   // ======================= Ready State Check ===========================
@@ -530,7 +546,7 @@ void setup() {
   if (state != FAULT) {
     state = READY;
     logActivity("EVENT", "Transition to Ready state");
-    if (!sendRadioMessageAckRetry("ST:READY", 3)) {
+    if (!sendRadioMessage("ST:READY", GROUND_STATION_ADDR)) {
       // The message was not confirmed as sent
 #ifdef DEBUG
       Serial.println("Ready state transition not acknowledged");
@@ -610,7 +626,39 @@ void readyStateLoop() {
   checkGPS();
   
   // Check for an ARM event every time through the loop
-  checkArmCommand();
+  if (checkArmCommand()) {
+    state = ARMED;
+    logActivity("Event", "Armed");
+#ifdef DEBUG
+    Serial.println("Arm command received and acknowledged");
+#endif
+    // Measure sensor offset errors
+
+    // Get GPS fix of launch point & compute baro altitude error
+    if (getLaunchPointFix()) {
+      // Open data logging file
+      openDataFile();
+      if (dataFile) {
+        String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
+                           "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
+        dataFile.println(headerRow);
+      } else {
+        // Data file could not be opened
+        state = FAULT;
+        logActivity("ERROR", "SD Card write error");
+        sendRadioMessage("ST:FAULT", GROUND_STATION_ADDR);
+#ifdef DEBUG
+        Serial.println("SD card write error while arming");
+#endif
+      }
+    } else {
+      state = FAULT;
+      sendRadioMessage("ST:FAULT", GROUND_STATION_ADDR);
+#ifdef DEBUG
+      Serial.println("Error reading altimeter while arming");
+#endif
+    }
+  }
 
   // Check battery voltage and report via radio
   counter++;
@@ -634,8 +682,8 @@ void readyStateLoop() {
     if (lipoBatteryVoltage < BAT_VOLT_LOW) {
       state = FAULT;
       logActivity("ERROR", "Battery voltage low");
-      sendRadioMessageNoAck("MS:Battery Low");
-      sendRadioMessageAckRetry("ST:ERROR", 3);
+      sendRadioMessage("MS:Battery Low", GROUND_STATION_ADDR);
+      sendRadioMessage("ST:ERROR", GROUND_STATION_ADDR);
     }
   }
 }
@@ -658,9 +706,9 @@ void armedStateLoop() {
   checkGPS();
   
   // Check for a DISARM event every time through the loop
-  if (checkRadioMessage("disarm")) {
+  if (checkRadioMessage("disarm", GROUND_STATION_ADDR)) {
     state = READY;
-    sendRadioMessageAckRetry("ST:READY", 3);
+    sendRadioMessage("ST:READY", GROUND_STATION_ADDR);
     logActivity("EVENT", "Disarmed");
     closeDataFile();
     digitalWrite(LED, LOW);
@@ -680,7 +728,7 @@ void armedStateLoop() {
     state = LOGGING;
     digitalWrite(LED, LOW); // Make sure the on-board LED is off
     logActivity("EVENT", "Launch");
-    sendRadioMessageNoAck("ST:LAUNCHED");
+    sendRadioMessage("ST:LAUNCHED", GROUND_STATION_ADDR);
     return;
   }
   
@@ -774,7 +822,7 @@ timeOutCounter++;
   if (isLanded()) {
     state = POST_FLIGHT;
     postFlightDataLog("LANDED");
-    sendRadioMessageAckRetry("ST:LANDED", 60);
+    sendRadioMessage("ST:LANDED", GROUND_STATION_ADDR);
   }
       
 
@@ -782,7 +830,7 @@ timeOutCounter++;
   if (timeOutCounter * TC5_INT_PERIOD > TIME_OUT * 1000) {
     state = POST_FLIGHT;
     postFlightDataLog("TIMEOUT");
-    sendRadioMessageAckRetry("ST:LANDED", 60);
+    sendRadioMessage("ST:LANDED", GROUND_STATION_ADDR);
     timeOutCounter = 0;
   }
 
@@ -811,8 +859,8 @@ void postFlightStateLoop() {
   flashLED(LED_PPS_POST_FLIGHT);
 
   // Check for an incoming "connect" radio message
-  if (checkRadioMessage("connect")) {
-    sendRadioMessageNoAck("connect");
+  if (checkRadioMessage("connect", GROUND_STATION_ADDR)) {
+    sendRadioMessage("connect", GROUND_STATION_ADDR);
     connected = true;
   }
 
@@ -821,20 +869,20 @@ void postFlightStateLoop() {
 
     String dataString = "AL:";
     dataString += String(maxAltitude);
-    sendRadioMessageAckRetry(dataString.c_str(), 3);
+    sendRadioMessage(dataString.c_str(), GROUND_STATION_ADDR);
     delay(20);
     
     dataString = "AC:";
     dataString += String(maxAcceleration);
-    sendRadioMessageAckRetry(dataString.c_str(), 3);
+    sendRadioMessage(dataString.c_str(), GROUND_STATION_ADDR);
     delay(20);
 
     dataString = "DU:";
     dataString += String(flightLength);
-    sendRadioMessageAckRetry(dataString.c_str(), 3);
+    sendRadioMessage(dataString.c_str(), GROUND_STATION_ADDR);
     delay(20);
 
-    sendRadioMessageNoAck("AT:AGAIN");
+    sendRadioMessage("AT:AGAIN", GROUND_STATION_ADDR);
     delay(20);
 
     
@@ -842,7 +890,7 @@ void postFlightStateLoop() {
   }
 
   // Check for the "again" message
-  if (checkRadioMessage("again")) {
+  if (checkRadioMessage("again", GROUND_STATION_ADDR)) {
     state = READY;
     maxAltitude = 0;
     maxAcceleration = 0;
@@ -854,7 +902,7 @@ void postFlightStateLoop() {
     logActivity("EVENT", "READY");
     sent = false;
     connected = false;
-    sendRadioMessageAckRetry("ST:READY", 3);
+    sendRadioMessage("ST:READY", GROUND_STATION_ADDR);
   }
 }
 
@@ -1041,13 +1089,13 @@ double readBatteryVoltage(void) {
 // ==========================================================================
 void displayBatteryLevel(void) {
   if (lipoBatteryVoltage >= BAT_VOLT_FULL) {
-    sendRadioMessageNoAck("BT:FULL");
+    sendRadioMessage("BT:FULL", GROUND_STATION_ADDR);
   } else if (lipoBatteryVoltage >= BAT_VOLT_OK) {
-    sendRadioMessageNoAck("BT:OK");
+    sendRadioMessage("BT:OK", GROUND_STATION_ADDR);
   } else if (lipoBatteryVoltage >= BAT_VOLT_LOW) {
-    sendRadioMessageNoAck("BT:LOW");
+    sendRadioMessage("BT:LOW", GROUND_STATION_ADDR);
   } else {
-    sendRadioMessageNoAck("BT:CRITICAL");
+    sendRadioMessage("BT:CRITICAL", GROUND_STATION_ADDR);
   }
   
 }
@@ -1314,82 +1362,51 @@ bool isLanded() {
           }
 }
 
-//=================== sendRadioMessageNoAck ======================
-// Sends a radio message with no acknowledment required.
+//=================== sendRadioMessage ======================
+// Sends a radio message to the specified address
 // Parameters:
 //  message:  The radio message that is to be sent
-// Return: None
+//  address: The address the message is to be sent to
+// Return: True if an acknowledgment was received
 //=================================================================
-void sendRadioMessageNoAck(const char * message) {
+bool sendRadioMessage(const char * message, uint8_t address) {
   strncpy(radioPacket, message, sizeof(radioPacket));
-  radioDriver.send((uint8_t *)radioPacket, sizeof(radioPacket));
-  delay(10);
-
+  if (radioManager.sendtoWait((uint8_t *)radioPacket, sizeof(radioPacket), address)) {
 #ifdef DEBUG
   Serial.print("Radio message sent: ");
   Serial.println(message);
 #endif
-  // Block here until the packet has been sent
-  radioDriver.waitPacketSent();
-  delay(200);
+  return true;
+  } else {
+    radioError++;
+#ifdef DEBUG
+    Serial.println("No message ack");
+    Serial.print("Radio Error #: ");
+    Serial.println(radioError);
+#endif
+    return false;
+  }
 }
-
-
-//=================== sendRadioMessageAckRetry ====================
-// Sends a radio message with acknowledment required. Resends the
-// message if no acknowledgment is received.
-// Parameters:
-//  message:  The radio message that is to be sent
-//  retries:  The number of times that the message will be resent
-// Return: True if a acknowledment was received
-//=================================================================
-bool sendRadioMessageAckRetry(const char * message, uint8_t retries) {
-  strncpy(radioPacket, message, sizeof(radioPacket));
-
-  uint8_t attempt = 0;
-  while (attempt <= retries) {
-    // Send the message
-    radioDriver.send((uint8_t *)radioPacket, sizeof(radioPacket));
-    delay(10);
-    radioDriver.waitPacketSent();
-
-    // Listen for an acknowledgment
-    uint8_t length;
-    if (radioDriver.waitAvailableTimeout(1000)) {
-      if (radioDriver.recv((uint8_t *)buffer, &length)) {
-        if (length != 0) {
-          if (!strncmp(buffer, message, sizeof(message))) {
-            return true;
-          }
-        }
-      }
-    } // End listen for acknowledgement
-
-    // Try again
-    attempt++;
-  } // End while loop
-
-  return false;
-  
-}
-
 
 //======================= checkRadioMessage =======================
 // Checks if the specified radio message has been received.
 // Parameters:
 //  message:  The radio message to check for
+//  fromSender: The sender's address
 // Return: True if the message was received
 //=================================================================
-bool checkRadioMessage(const char * message) {
-  uint8_t messageLength;
-  char messageBuffer[MAX_MESSAGE_LENGTH];
+bool checkRadioMessage(const char * message, uint8_t fromSender) {
   
-  if (radioDriver.available()) {
-    if (radioDriver.recv((uint8_t *)messageBuffer, &messageLength)) {
-      if (messageLength != 0) {
-        if (!strncmp(messageBuffer, message, sizeof(message))) {
-          return true;
-        }
+  char messageBuffer[MAX_MESSAGE_LENGTH];
+  uint8_t messageLength = sizeof(messageBuffer);
+  uint8_t from;
+  
+  if (radioManager.recvfromAck((uint8_t*)messageBuffer, &messageLength, &from)) {
+    // Received a message. Is it from the correct sender?
+    if (from == fromSender) {
+      // The message is from the correct sender. Is it the right message?
+      if (!strncmp(messageBuffer, message, sizeof(message))) {
+        return true;
       }
     }
   }
@@ -1438,59 +1455,37 @@ bool getLaunchPointFix() {
 
 //======================= checkArmCommand =========================
 // Checks for a valid arm command from the ground station. Validity
-// check includes checking if the rocket is vertical, checking
-// that the arm command could be acknowledged, the launch point
-// baro altitude error could be computed, and the data file could
-// be opened. If an error is detected then the state is changed to
-// FAULT.
+// check includes checking if the rocket is vertical and checking
+// that the arm command could be acknowledged.
 // Parameters: None
-// Return: None
+// Return: True if arm command received and acknowledged. False
+//         otherwise.
 //=================================================================
-void checkArmCommand() {
-  if (checkRadioMessage("arm")) {
+bool checkArmCommand() {
+  if (checkRadioMessage("arm", GROUND_STATION_ADDR)) {
     if (accelerometer_gyro.getXAxisAccel() > 0.9) {
-
       // Acknowledge receipt of the arm command
-      if (sendRadioMessageAckRetry("ST:ARMED", 3)) {
-        state = ARMED;
-        logActivity("Event", "Armed");
+      if (sendRadioMessage("ST:ARMED", GROUND_STATION_ADDR)) {
 #ifdef DEBUG
         Serial.println("Arm command received and acknowledged");
 #endif
-        // Get GPS fix of launch point & compute baro altitude error
-        if (!getLaunchPointFix()) {
-          state = FAULT;
-          sendRadioMessageAckRetry("ST:FAULT", 3);
-#ifdef DEBUG
-          Serial.println("Error reading altimeter while arming");
-#endif
-        }
-        // Open data file in preparation for data logging
-        openDataFile();
-        if (dataFile) {
-          String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
-                             "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
-          dataFile.println(headerRow);
-        } else {
-          // Data file could not be opened
-          logActivity("ERROR", "SD Card write error");
-          sendRadioMessageNoAck("ER:SD Card Write");
-#ifdef DEBUG
-          Serial.println("SD card write error");
-#endif
-        }
+        return true;
       } else {
         // Could not acknowledge arm command
-        sendRadioMessageAckRetry("ST:READY", 3);
+        sendRadioMessage("ST:READY", GROUND_STATION_ADDR);
 #ifdef DEBUG
         Serial.println("Could not acknowledge arm command");
 #endif  
+        return false;
       }
 
     } else { 
       // The rocket is not vertical
       delay(200);
-      sendRadioMessageNoAck("ER:Not Vertical");
+      sendRadioMessage("ER:Not Vertical", GROUND_STATION_ADDR);
+      return false;
     } // End check if rocket is vertical
-  } // End checkRadioMessage
+  } else {
+    return false;
+  }
 }
