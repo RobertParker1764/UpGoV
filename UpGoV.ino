@@ -1,7 +1,7 @@
 // UpGoer5Instrumentation (Green)
 // Version: Beta 7
 // Author: Bob Parker
-// Date: 9/2/2023
+// Date: 11/10/2023
 // Tested: 
 //
 // Code for a model rocket instrumentation package. Measures and logs acceleration and turning
@@ -76,7 +76,7 @@
 #define GPSSerial Serial1
 #define GPSECHO false
 
-const String VERSION = "Beta 7.1";
+const String VERSION = "Beta 7.2";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -641,7 +641,7 @@ void readyStateLoop() {
       if (dataFile) {
         String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
                            "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
-        dataFile.println(headerRow);
+        dataFile.println(headerRow.c_str());
       } else {
         // Data file could not be opened
         state = FAULT;
