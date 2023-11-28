@@ -1,7 +1,7 @@
 // UpGoer5Instrumentation (Green)
-// Version: Beta 7
+// Version: Beta 7.3
 // Author: Bob Parker
-// Date: 11/10/2023
+// Date: 11/11/2023
 // Tested: 
 //
 // Code for a model rocket instrumentation package. Measures and logs acceleration and turning
@@ -67,7 +67,7 @@
 #include <RH_RF95.h>                  // Radio Head driver class for LoRa Radio
 #include <RHReliableDatagram.h>       // Radio Head manager class for reliable comms
 #include <H3LIS331.hpp>               // H3LIS331 sensor library code
-
+#include <Arduino.h>
 
 // ===============================  Constants  =====================================
 #define DEBUG // Uncomment to enable debug comments printed to the console
@@ -76,7 +76,7 @@
 #define GPSSerial Serial1
 #define GPSECHO false
 
-const String VERSION = "Beta 7.2";
+const char* VERSION = "Beta 7.3";
 
 // Arduino pin assignments
 const uint8_t BMP390_CS = 5;
@@ -154,7 +154,7 @@ double lipoBatteryVoltage = 0;   // Battery voltage of LiPo battery as measured 
 states state = START_UP;        // The current state
 errors error = NONE;            // Error
 double maxAcceleration = 0;      // The maximum axial acceleration measured during flight
-double maxAltitude = 0;          // The maximum altitude measured during flight
+double  maxAltitude = 0;          // The maximum altitude measured during flight
 uint32_t flightLength = 0;
 double velocity = 0;
 double maxVelocity = 0;
@@ -171,6 +171,9 @@ double baroAltitudeError;        // Difference between baro computed alt and GPS
 uint8_t buffer[MAX_MESSAGE_LENGTH]; // Message buffer
 char radioPacket[20];            // Buffer containing radio message
 int radioError = 0;              // The number of radio messages not receiving an ack
+float accelOffsetErrors[] = {0.0, 0.0, 0.0};  // Accelerometer zero offset errors
+float gyroOffsetErrors[] = {0.0, 0.0, 0.0};   // Gyro zero offset erros
+float highG_AccelOffsetError = 0.0;           // X Axis offset error for the high G Accel
 
 // =======================  TC5 Interrupt Handler  ===================================
 // TC5 will generate an interrupt at a rate determined by TC5_INT_PERIOD to drive the 
@@ -199,6 +202,7 @@ void setup() {
   Serial.println("UpGoer5 Intrumentation");
   Serial.print("Version: ");
   Serial.println(VERSION);
+  display_freeram();
     
 #endif
 
@@ -560,6 +564,8 @@ void setup() {
   // Enable TC5. We will start getting TC5 interrupts at the TC5_INT_PERIOD
   TC5->COUNT8.CTRLA.bit.ENABLE = 1;
   while (TC5->COUNT8.STATUS.bit.SYNCBUSY);
+
+  display_freeram();
   
 } // End setup code
 
@@ -633,15 +639,17 @@ void readyStateLoop() {
     Serial.println("Arm command received and acknowledged");
 #endif
     // Measure sensor offset errors
-
+    measureSensorOffsets();
+    
     // Get GPS fix of launch point & compute baro altitude error
     if (getLaunchPointFix()) {
       // Open data logging file
       openDataFile();
       if (dataFile) {
-        String headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
-                           "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)";
-        dataFile.println(headerRow.c_str());
+        const char* headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
+                           "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)\n";
+        display_freeram();
+        dataFile.write(headerRow);
       } else {
         // Data file could not be opened
         state = FAULT;
@@ -664,12 +672,14 @@ void readyStateLoop() {
   counter++;
   if (counter >= (BAT_MEAS_PER / TC5_INT_PERIOD)) {
     counter = 0;  // Reset the counter
+    display_freeram();
     lipoBatteryVoltage = readBatteryVoltage();
 
     // Log the battery reading in the event log
-    String logString = "Battery voltage = ";
-    logString += lipoBatteryVoltage;
-    logString += " volts";
+    char logString[35];
+    char buffer[5];
+    dtostrf(lipoBatteryVoltage, 2, buffer);
+    sprintf(logString, "Battery voltage = %s volts", buffer);
     logActivity("BATTERY", logString);
 #ifdef DEBUG
     Serial.print("Battery Voltage: ");
@@ -773,7 +783,7 @@ timeOutCounter++;
 
   // Update the maximum achieved altitude
   if (altitude > maxAltitude) {
-    maxAltitude = altitude;
+     maxAltitude = altitude;
   }
 
   // Check if we are at the apogee and release the parachute if we are
@@ -867,19 +877,20 @@ void postFlightStateLoop() {
   if (connected && !sent) {
     delay(5000);
 
-    String dataString = "AL:";
-    dataString += String(maxAltitude);
-    sendRadioMessage(dataString.c_str(), GROUND_STATION_ADDR);
+    char valueBuffer[2];
+    char logStringBuffer[15];
+    
+    sprintf(logStringBuffer, "AL: %u", (uint32_t)maxAltitude); 
+    sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
     delay(20);
     
-    dataString = "AC:";
-    dataString += String(maxAcceleration);
-    sendRadioMessage(dataString.c_str(), GROUND_STATION_ADDR);
+    dtostrf(maxAcceleration, 2, valueBuffer);
+    sprintf(logStringBuffer, "AC:%s", valueBuffer);
+    sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
     delay(20);
 
-    dataString = "DU:";
-    dataString += String(flightLength);
-    sendRadioMessage(dataString.c_str(), GROUND_STATION_ADDR);
+    sprintf(logStringBuffer, "DU:%u", flightLength);
+    sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
     delay(20);
 
     sendRadioMessage("AT:AGAIN", GROUND_STATION_ADDR);
@@ -914,7 +925,7 @@ void postFlightStateLoop() {
 // ===================== printAltimeterError ================================
 // Prints an altimeter related error string to the Serial monitor console
 // ==========================================================================
-void printAltimeterError(String preamble, int8_t errorCode) {
+void printAltimeterError(const char* preamble, int8_t errorCode) {
   Serial.print(preamble);
   switch (errorCode) {
     case INVALID_POWER_MODE:
@@ -973,38 +984,35 @@ void printAltimeterError(String preamble, int8_t errorCode) {
 // ==========================================================================
 void logData(uint32_t time) {
   // Empty string for log data
-  String logData = "";
+  char logData[100];
+  char tempBuf[8];
+  char pressBuf[8];
+  char hAccelBuf[8];
+  char xAccelBuf[8];
+  char yAccelBuf[8];
+  char zAccelBuf[8];
+  char xRateBuf[10];
+  char yRateBuf[10];
+  char zRateBuf[10];
+
+  // Convert double values to strings
+  dtostrf(temperature, 1, tempBuf);
+  dtostrf(pressure, 1, pressBuf);
+  dtostrf(accelHighG.getX_Accel(), 1, hAccelBuf);
+  dtostrf(accelerometer_gyro.getXAxisAccel(), 2, xAccelBuf);
+  dtostrf(accelerometer_gyro.getYAxisAccel(), 2, yAccelBuf);
+  dtostrf(accelerometer_gyro.getZAxisAccel(), 2, zAccelBuf);
+  dtostrf(accelerometer_gyro.getXAxisRate(), 2, xRateBuf);
+  dtostrf(accelerometer_gyro.getYAxisRate(), 2, yRateBuf);
+  dtostrf(accelerometer_gyro.getZAxisRate(), 2, zRateBuf);
 
   // Create the logData string
-  logData += time;
-  logData += ",";
-  logData += temperature;
-  logData += ",";
-  logData += pressure;
-  logData += ",";
-  logData += altitude;
-  logData += ",";
-  logData += accelHighG.getX_Accel();
-  logData += ",";
-  logData += accelerometer_gyro.getXAxisAccel();
-  logData += ",";
-  logData += accelerometer_gyro.getYAxisAccel();
-  logData += ",";
-  logData += accelerometer_gyro.getZAxisAccel();
-  logData += ",";
-  logData += accelerometer_gyro.getXAxisRate();
-  logData += ",";
-  logData += accelerometer_gyro.getYAxisRate();
-  logData += ",";
-  logData += accelerometer_gyro.getZAxisRate();
-  logData += ",";
-  logData += velocity;
-  logData += "\n";
+  sprintf(logData, "%u,%s,%s,%u,%s,%s,%s,%s,%s,%s,%s,%u", time, tempBuf, pressBuf, (uint32_t)altitude, hAccelBuf, xAccelBuf, yAccelBuf, zAccelBuf, xRateBuf, yRateBuf, zRateBuf, (uint32_t)velocity);
 
   // Write the log data to the SD card
   openDataFile();
   if (dataFile) {
-    dataFile.println(logData);
+    dataFile.write(logData);
     //dataFile.close();
   } else {
 #ifdef DEBUG
@@ -1048,13 +1056,10 @@ int8_t readAltimeterData() {
 void openDataFile() {
   // Make sure the file has not already been opened
   if (!dataFileOpen) {
-    String dataFileName = "";
-    dataFileName += gps.year;
-    dataFileName.remove(0, 2);
-    dataFileName += gps.month;
-    dataFileName += gps.day;
-    dataFileName += gps.minute;
-    dataFileName += ".txt";
+    char dataFileName[13];
+    uint8_t theYear = gps.year;
+    theYear %= 100;
+    sprintf(dataFileName, "%u%u%u%u.txt", theYear, gps.month, gps.day, gps.minute);
 #ifdef DEBUG
     Serial.print("Log file name: ");
     Serial.println(dataFileName);
@@ -1103,26 +1108,12 @@ void displayBatteryLevel(void) {
 // ============================ logActivity =================================
 // Create a log string and write it to the SD card along with a time stamp
 // ==========================================================================
-void logActivity(String type, String logEntry) {
+void logActivity(const char * type, const char * logEntry) {
   
   // Compose the log string
-  String logString = "";
-  
-  logString += gps.year;
-  logString += "-";
-  logString += gps.month;
-  logString += "-";
-  logString += gps.day;
-  logString +="T";
-  logString += gps.hour;
-  logString += ":";
-  logString += gps.minute;
-  logString += ":";
-  logString += gps.seconds;
-  logString += "PST|";
-  logString += type;
-  logString += "|";
-  logString += logEntry;
+  char logString[80];
+   
+  sprintf(logString, "%u-%u-%uT%u:%u:%uPST|%s|%s", gps.year, gps.month, gps.day, gps.hour, gps.minute, gps.seconds, type, logEntry);
   
 #ifdef PRINT_LOG_DATA
   Serial.println(logString);
@@ -1133,7 +1124,7 @@ void logActivity(String type, String logEntry) {
   
   // Write the log data to the SD card
   if (logFile) {
-    logFile.println(logString);
+    logFile.write(logString);
     // Close the log file
     logFile.close();
   } else {
@@ -1206,7 +1197,7 @@ bool isLaunched() {
 // Prints to the SD card max altitude, max acceleration, and flight
 // duration after timeout\landing.
 // ====================================================================
- void postFlightDataLog(String flightEndCause) {
+ void postFlightDataLog(const char * flightEndCause) {
   state = POST_FLIGHT;
   if (dataFileOpen) {
     closeDataFile();
@@ -1216,21 +1207,16 @@ bool isLaunched() {
   uint32_t landTime = millis();
   flightLength = landTime - launchTime;
   flightLength /= 1000;
-  String logString = "Maximum acceleration = ";
-  logString += maxAcceleration;
-  logString += " Gs";
+  char logString[40];
+  char buffer[8];
+  dtostrf(maxAcceleration, 2, buffer);
+  sprintf(logString, "Maximum acceleration = %s Gs", buffer);
   logActivity("STATUS", logString);
-  logString = "Maximum altitude = ";
-  logString += maxAltitude;
-  logString += " ft";
+  sprintf(logString, "Maimum altitude = %u ft", (uint32_t)maxAltitude);
   logActivity("STATUS", logString);
-  logString = "FLight duration = ";
-  logString += flightLength;
-  logString += " sec";
+  sprintf(logString, "Flight duration = %u sec", flightLength);
   logActivity("STATUS", logString);
-  logString = "Maximum velocity = ";
-  logString += maxVelocity;
-  logString += " fps";
+  sprintf(logString, "Maximum velocity = %u fps", (uint32_t)maxVelocity);
   logActivity("STATUS", logString);
  }
 
@@ -1428,14 +1414,16 @@ bool getLaunchPointFix() {
   launchPointAlt = gps.altitude;
 
   // Log the GPS location data
-  String logString = "Launch Point Latitude: ";
-  logString += launchPointLat;
+  char logString[45];
+  char buffer[12];
+  dtostrf(launchPointLat, 5, buffer);
+  sprintf(logString, "Launch Point Latitude: %s", buffer);
   logActivity("STATUS", logString);
-  logString = "Launch Point Longitude: ";
-  logString += launchPointLon;
+  dtostrf(launchPointLon, 5, buffer);
+  sprintf(logString, "Launch Point Longitude: %s", buffer);
   logActivity("STATUS", logString);
-  logString = "Launch Point Altitude: ";
-  logString += launchPointAlt;
+  dtostrf(launchPointAlt, 1, buffer);
+  sprintf(logString, "Launch Point Altitude: %s meters", buffer);
   logActivity("STATUS", logString);
 
   // Initialize maximum altitude
@@ -1488,4 +1476,101 @@ bool checkArmCommand() {
   } else {
     return false;
   }
+}
+
+//==================== measureSensorOffsets =======================
+// Measures the sensor offset errors and stores the measured offset
+// errors in the global variables. Ten consecutive measurements are
+// taken and the average offset is computed.
+// Parameters: None
+// Return: None
+//=================================================================
+void measureSensorOffsets(void) {
+  float sensorReadingsXSum = 0.0;
+  float sensorReadingsYSum = 0.0;
+  float sensorReadingsZSum = 0.0;
+
+  // Measure the H3LIS331 Accelerometer X-Axis offset
+  for (uint8_t index = 0; index < 10; index++) {
+    while (!accelHighG.isDataReady()) {;} // Hang here until data is ready
+    sensorReadingsXSum += accelHighG.getX_Accel();
+    
+  }
+  highG_AccelOffsetError = sensorReadingsXSum / 10;
+
+  // Measure LSM6DS032 accelerometer offsets
+  sensorReadingsXSum = 0.0;
+  for (uint8_t index = 0; index < 10; index++) {
+    while(!accelerometer_gyro.accelDataReady()) {;} // Hang here until data is ready
+    accelerometer_gyro.readAccelData();
+    sensorReadingsXSum += accelerometer_gyro.getXAxisAccel();
+    sensorReadingsYSum += accelerometer_gyro.getYAxisAccel();
+    sensorReadingsZSum += accelerometer_gyro.getZAxisAccel();
+  }
+  accelOffsetErrors[0] = sensorReadingsXSum / 10;
+  accelOffsetErrors[1] = sensorReadingsYSum / 10;
+  accelOffsetErrors[2] = sensorReadingsZSum / 10;
+
+  // Measure LSM6DS032 gyro offsets
+  sensorReadingsXSum = 0.0;
+  sensorReadingsYSum = 0.0;
+  sensorReadingsZSum = 0.0;
+  for (uint8_t index = 0; index < 10; index++) {
+    while(!accelerometer_gyro.gyroDataReady()) {;} // Hang here until data is ready
+    accelerometer_gyro.readGyroData();
+    sensorReadingsXSum += accelerometer_gyro.getXAxisRate();
+    sensorReadingsYSum += accelerometer_gyro.getYAxisRate();
+    sensorReadingsZSum += accelerometer_gyro.getZAxisRate();
+  }
+  gyroOffsetErrors[0] = sensorReadingsXSum / 10;
+  gyroOffsetErrors[1] = sensorReadingsYSum / 10;
+  gyroOffsetErrors[2] = sensorReadingsZSum / 10;
+
+#ifdef DEBUG
+  Serial.print("H3LIS331 X Axis Offset: ");
+  Serial.print(highG_AccelOffsetError);
+  Serial.println(" Gs");
+  Serial.print("LSM6DS032 Accel Offsets -- X: ");
+  Serial.print(accelOffsetErrors[0]);
+  Serial.print(" Gs  Y: ");
+  Serial.print(accelOffsetErrors[1]);
+  Serial.print(" Gs  Z: ");
+  Serial.print(accelOffsetErrors[2]);
+  Serial.println(" Gs");
+  Serial.print("LSM6DS032 Gyro Offset -- X: ");
+  Serial.print(gyroOffsetErrors[0]);
+  Serial.print(" Deg/Sec  Y: ");
+  Serial.print(gyroOffsetErrors[1]);
+  Serial.print(" Deg/Sec  Z: ");
+  Serial.print(gyroOffsetErrors[2]);
+  Serial.println(" Deg/Sec");
+#endif
+
+}
+
+//========================== dtostrf ==============================
+// Converts a floating point value to a c-string
+// Parameters:
+//  value:  The floating point value to convert
+//  precision:  The number of digits to the right of the decimal
+//  buffer: The location where the c-string will be stored
+// Return: None
+//=================================================================
+void dtostrf(double value, uint8_t precision, char * buffer) {
+  uint32_t iPart = (uint32_t)value;
+  uint32_t dPart = (uint32_t)((value - (double)iPart) * pow(10, precision));
+  sprintf(buffer, "%d.%d", iPart, dPart);
+}
+
+//==================== Ram checking functions ===========================
+extern "C" char* sbrk(int incr);
+
+void display_freeram(){
+  Serial.print(F("- SRAM left: "));
+  Serial.println(freeRam());
+}
+
+int freeRam() {
+  char top;
+  return &top - reinterpret_cast<char*>(sbrk(0));
 }
