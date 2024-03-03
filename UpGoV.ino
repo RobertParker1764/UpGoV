@@ -1,8 +1,7 @@
 // UpGoer5Instrumentation (Green)
-// Version: Beta 7.4
+// Version: Beta 7.5
 // Author: Bob Parker
-// Date: 02/29/2024
-// Tested:
+// Date: 03/02/2024
 //
 // Code for a model rocket instrumentation package. Measures and logs acceleration and turning
 // rates along three axis. Measures and logs atmospheric pressure and computed altitude above
@@ -56,6 +55,9 @@
 //         Added measurement of in-flight event battery voltage (7.4 volts). Report status via radio
 //         Incorporate power saving measures
 
+// Beta 7.5: Added support for a JSON settings file on the SD card that is used to control several app
+//           settings at startup.
+
 // ==============================  Include Files  ==================================
 #include <SPI.h>                 // Sensor and micro SD card communication
 #include <SD.h>                  // SD card library functions
@@ -68,6 +70,7 @@
 #include <RHReliableDatagram.h>  // Radio Head manager class for reliable comms
 #include <H3LIS331.hpp>          // H3LIS331 sensor library code
 #include <Arduino.h>
+#include <ArduinoJson.h>         // JASON file support for app settings
 
 // ===============================  Constants  =====================================
 #define DEBUG  // Uncomment to enable debug comments printed to the console
@@ -76,7 +79,7 @@
 #define GPSSerial Serial1
 #define GPSECHO false
 
-const char* VERSION = "Beta 7.3";
+const char* VERSION = "Beta 7.5";
 
 // Feather M0 pin assignments
 const uint8_t BMP390_CS = 5;         // PA15
@@ -104,23 +107,15 @@ const uint16_t LED_PP_FAULT = 100;          // LED pulse period while in FAULT s
 const uint16_t LED_PP_ARMED = 200;          // LED pulse period while in ARMED state (ms)
 const uint16_t LED_PP_POST_FLIGHT = 10000;  // LED pulse period in POST_FLIGHT state (ms)
 const uint8_t LED_PULSE_WIDTH = 50;         // LED pulse width in all states (ms)
-const double SEA_LVL_PRESS = 1013.25;       // Sea level pressure in hpa
 const double METERS_TO_FEET = 3.28084;      // Conversion from meters to feet
-const long LOG_FILE_DURATION = 10;          // How long sensor data is logged to the log file in seconds
-const double BAT1_VOLT_LOW = 3.5;           // 3.3v LiPo battery voltage threshold for low charge
-const double BAT1_VOLT_FULL = 4.1;          // 3.3V LiPo battery voltage threshold for full charge
-const double BAT1_VOLT_OK = 3.7;            // 3.3V LiPo battery voltage threshold for medium charge
 const uint16_t BAT_MEAS_PER = 30000;        // LiPo battery voltage measurement frequency (ms)
-const double NO_MOTION_UPPER = 2.0;         // Rate below which we are not moving (degrees per second)
-const double NO_MOTION_LOWER = -2.0;        // Rate above which we are not moving (degrees per second)
-const uint16_t TIME_OUT = 30;               // Time after which we will assume we have landed if landing has not been detected (seconds).
-const double LAUNCH_ACCEL = 0.2;            // Threshold for launch determination in G's
 const uint16_t EVENT_SIG_DURATION = 2000;   // Duration of event signal pulse in milliseconds
 const double GRAVITY_ACC = 32.174;          // The acceleration on the surface of the Earth in f/sec2
 const float RF95_FREQ = 915.0;              // LoRa radio frequency (MHz)
 const uint8_t MAX_MESSAGE_LENGTH = 20;      // Maximum LoRa radio message length
 const uint8_t UPGOV_ADDR = 2;               // Radio address for UpGoV avionics package
 const uint8_t GROUND_STATION_ADDR = 1;      // Radio address for the Ground Station
+const char* settingsFileName = "Settings.txt";  // Name of the settings file on the SD card
 
 
 enum states { START_UP,
@@ -137,7 +132,30 @@ enum errors { NONE,
               GYRO,
               ACCEL,
               ALT,
-              BATTERY };
+              BATTERY 
+};
+
+// Struct to hold the app parameters that are set via the SD card settings file
+struct Settings {
+  double bat1VoltLow;           // 3.7v LiPo battery voltage threshold for low charge
+  double bat1VoltOK;            // 3.7V LiPo battery voltage threshold for medium charge
+  double bat1VoltFull;          // 3.7V LiPo battery voltage threshold for full charge
+  bool bat2Present;             // True: External event battery installed
+  double bat2VoltLow;           // 7.4V LiPo battery voltage threshold for low charge
+  double bat2VoltOK;            // 7.4V LiPo battery voltage threshold for medium charge
+  double bat2VoltFull;          // 7.4V LiPo battery voltage threshold for full charge 
+  uint8_t parachute;            // 0: function not used; 1 to 4: The event to use for this function
+  uint8_t drogueParachute;      // 0: function not used; 1 to 4: The event to use for this function
+  uint8_t secondStage;          // 0: function not used; 1 to 4: The event to use for this function
+  uint8_t firstStateIgnition;   // 0: function not used; 1 to 4: The event to use for this function
+  double seaLevelPressure;      // Atmospheric pressure at sea level
+  int logFileDuration;          // Data logging duration if landing is not detected
+  double launchAccelThreshold;  // Acceleration level above which a launch will be detected
+  double landedThreshold;       // Axial rotation rate below which a landing will be detected
+  int flightTimeout;            // Time after which we will assume we have landed if landing has not been detected (seconds).
+  uint8_t upGoVAddr;            // LoRa radio address of this UpGoV avionics instance
+  bool  groundTest;             // True: Ground test mode activated.
+};
 
 // ===================================  Global Objects  ===================================================
 
@@ -146,10 +164,11 @@ BMP3XX altimeter;                                                            // 
 LSM6DSO32 accelerometer_gyro;                                                // Accelerometer/Gyro sensor object instance
 H3LIS331 accelHighG;                                                         // H3LIS331 high accelerometer object instance
 RH_RF95 radioDriver(RADIO_SPI_CS, RADIO_SPI_IRQ);                            // LoRa radio driver object
-RHReliableDatagram radioManager(radioDriver, UPGOV_ADDR);                    // LoRa radio manager object
+RHReliableDatagram radioManager(radioDriver);                    // LoRa radio manager object
 Adafruit_GPS gps(&GPSSerial);                                                // GPS object
 File dataFile;                                                               // Data file object
 File logFile;                                                                // Log file object
+Settings settings;                                                           // Application settings
 
 // ================================ Global Variables ======================================================
 
@@ -258,7 +277,30 @@ void setup() {
   Serial.println("Waiting for ground station connect");
 #endif
 
-  radioManager.setThisAddress(UPGOV_ADDR);
+  // ============================ SD Card Library Setup ================================
+
+  if (!SD.begin(SD_CARD_CS)) {
+#ifdef DEBUG
+    Serial.println("SD card failed to initialize");
+#endif
+    while (1)
+      ;  // Hang here
+  } else {
+#ifdef DEBUG
+    Serial.println("SD card initialized");
+#endif
+  }
+
+  // Read the settings file
+  loadSettings(settingsFileName, settings);
+
+  if (settings.groundTest) {
+    logActivity("TEST", "Ground Test");
+  }
+
+  // ========================== Connect to Ground Station ===============================
+
+  radioManager.setThisAddress(settings.upGoVAddr);
 
   // Block here until we connect to the UpGoV Ground Station
   bool connected = false;
@@ -304,24 +346,7 @@ void setup() {
   pinPeripheral(12, PIO_SERCOM);
   sendRadioMessage("MS:Sensor SPI Init", GROUND_STATION_ADDR);
 
-  // ============================ SD Card Library Setup ================================
 
-  if (!SD.begin(SD_CARD_CS)) {
-#ifdef DEBUG
-    Serial.println("SD card failed to initialize");
-#endif
-    sendRadioMessage("ER:SD Card Init", GROUND_STATION_ADDR);
-    delay(20);
-    sendRadioMessage("ST:ERROR", GROUND_STATION_ADDR);
-    delay(20);
-    while (1)
-      ;  // Hang here
-  } else {
-#ifdef DEBUG
-    Serial.println("SD card initialized");
-#endif
-    sendRadioMessage("MS:SD Card Init", GROUND_STATION_ADDR);
-  }
 
   // ======================  SAMD21 Generic Clock Setup  ====================
   // Configure Generic Clock 6. It will we used as the source clock for the
@@ -412,16 +437,22 @@ void setup() {
   gps.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
 
   // Hold here until we get a GPS fix
-  while (!gpsFix) {
-    //Check for a new NMEA sentence and parse the results if received
-    checkGPS();
-    if (gps.fix) {
-      gpsFix = true;
+  if (!settings.groundTest) {
+    while (!gpsFix) {
+      // Check for a new NMEA sentence and parse the results if received
+      checkGPS();
+      if (gps.fix) {
+        gpsFix = true;
 #ifdef DEBUG
-      Serial.println("GPS Fix");
+        Serial.println("GPS Fix");
 #endif
+      }
+      delay(10);
     }
-    delay(10);
+  } else {
+#ifdef DEBUG
+    Serial.println("Bypassing GPS fix (Ground Test)");
+#endif
   }
 
   sendRadioMessage("MS:GPS Fix", GROUND_STATION_ADDR);
@@ -649,7 +680,7 @@ void goToReadyState() {
 //      measurement frequency is determined by BAT_MEAS_PER.
 //      Log the voltage reading in the event log.
 //   4. Periodically compare the measured battery voltages with the limits
-//      established by BAT1_VOLT_LOW and BAT2_VOLT_LOW. If either battery
+//      established by settings.bat1VoltLow and BAT2_VOLT_LOW. If either battery
 //      voltage falls below the limit then the state is changed to fault state
 //      and this event is noted in the event log and is reported via the
 //      radio.
@@ -691,7 +722,7 @@ void readyStateLoop() {
     displayBatteryLevel(bat1Voltage);
 
     // Check if the battery voltage is low. Go to FAULT state if it is
-    if (bat1Voltage < BAT1_VOLT_LOW) {
+    if (bat1Voltage < settings.bat1VoltLow) {
       state = FAULT;
       logActivity("ERROR", "Battery voltage low");
       sendRadioMessage("MS:Battery Low", GROUND_STATION_ADDR);
@@ -719,10 +750,7 @@ void goToArmState() {
       const char* headerRow = "Time(ms), Temp(degC), Pres(hPa), Alt(ft), XH_Accel(Gs), X_Accel(Gs), Y_Accel(Gs), "
                               "Z_Accel(Gs), X_Rate(dps), Y_Rate(dps), Z_Rate(dps), Velocity(fps)\n";
       noInterrupts();
-      Serial.print("dataFile name = ");
-      Serial.println(dataFile.name());
       dataFile.write(headerRow, strlen(headerRow));
-      Serial.println("Header row written");
       interrupts();
     } else {
       // Data file could not be opened
@@ -802,11 +830,11 @@ void goToLoggingState() {
 
 // ============================= Logging State Loop =========================
 // Data logging will progress in two different modes depending upon the value
-// of the constant LOG_FILE_DURATION. If LOG_FILE_DURATION is equal to 0 then
+// of setting.logFileDuration. If settings.logFileDuration is equal to 0 then
 // data logging continues until the model rocket has landed as determined by
-// the angular rate readings. If LOG_FILE_DURATION is not equal to 0 then
+// the angular rate readings. If settings.logFileDuration is not equal to 0 then
 // the logging continues only for the number of seconds specified by
-// LOG_FILE_DURATION or until the model rocket lands.
+// settings.logFileDuration or until the model rocket lands.
 // In the logging state the following activities occur
 //   1. Measure 3-axis acceleration
 //   2. Measure 3-axis angular rates
@@ -875,7 +903,7 @@ void loggingStateLoop() {
   }
 
 
-  if ((LOG_FILE_DURATION == 0) || ((timeInMS - launchTime) <= (LOG_FILE_DURATION * 1000))) {
+  if ((settings.logFileDuration == 0) || ((timeInMS - launchTime) <= (settings.logFileDuration * 1000))) {
 
     //Log the data
     logData(timeInMS);
@@ -891,7 +919,7 @@ void loggingStateLoop() {
 
 
   // Check for timeout
-  if (timeOutCounter * TC5_INT_PERIOD > TIME_OUT * 1000) {
+  if (timeOutCounter * TC5_INT_PERIOD > settings.flightTimeout * 1000) {
     state = POST_FLIGHT;
     postFlightDataLog("TIMEOUT");
     sendRadioMessage("ST:LANDED", GROUND_STATION_ADDR);
@@ -1104,7 +1132,7 @@ int8_t readAltimeterData() {
   } else {
     temperature = altimeter.getTemperature();
     pressure = altimeter.getPressure() / 100.0;
-    altitude = (altimeter.getAltitude(SEA_LVL_PRESS));
+    altitude = (altimeter.getAltitude(settings.seaLevelPressure));
   }
   return errorCode;
 }
@@ -1153,11 +1181,11 @@ double readBatteryVoltage(void) {
 // device.
 // ==========================================================================
 void displayBatteryLevel(double batteryVoltage) {
-  if (batteryVoltage >= BAT1_VOLT_FULL) {
+  if (batteryVoltage >= settings.bat1VoltFull) {
     sendRadioMessage("B1:FULL", GROUND_STATION_ADDR);
-  } else if (batteryVoltage >= BAT1_VOLT_OK) {
+  } else if (batteryVoltage >= settings.bat1VoltOK) {
     sendRadioMessage("B1:OK", GROUND_STATION_ADDR);
-  } else if (batteryVoltage >= BAT1_VOLT_LOW) {
+  } else if (batteryVoltage >= settings.bat1VoltLow) {
     sendRadioMessage("B1:LOW", GROUND_STATION_ADDR);
   } else {
     sendRadioMessage("B1:CRITICAL", GROUND_STATION_ADDR);
@@ -1244,7 +1272,7 @@ bool isLaunched() {
   // Read the accelerometer/gyro sensor data
   accelerometer_gyro.readAccelData();
   // Check if acceleration measurement exceeds launch threshold
-  if ((accelerometer_gyro.getXAxisAccel() - avgEarthAccel) > LAUNCH_ACCEL) {
+  if ((accelerometer_gyro.getXAxisAccel() - avgEarthAccel) > settings.launchAccelThreshold) {
 
     return true;
 
@@ -1391,7 +1419,7 @@ bool atApogee() {
 // Return:  True if a landing is detected. False otherwise.
 // ===================================================================
 bool isLanded() {
-  if ((accelerometer_gyro.getXAxisRate() < NO_MOTION_UPPER) && (accelerometer_gyro.getXAxisRate() > NO_MOTION_LOWER) && (accelerometer_gyro.getYAxisRate() < NO_MOTION_UPPER) && (accelerometer_gyro.getYAxisRate() > NO_MOTION_LOWER) && (accelerometer_gyro.getZAxisRate() < NO_MOTION_UPPER) && (accelerometer_gyro.getZAxisRate() > NO_MOTION_LOWER)) {
+  if ((accelerometer_gyro.getXAxisRate() < settings.landedThreshold) && (accelerometer_gyro.getXAxisRate() > -(settings.landedThreshold)) && (accelerometer_gyro.getYAxisRate() < settings.landedThreshold) && (accelerometer_gyro.getYAxisRate() > -(settings.landedThreshold)) && (accelerometer_gyro.getZAxisRate() < settings.landedThreshold) && (accelerometer_gyro.getZAxisRate() > -(settings.landedThreshold))) {
     return true;
   } else {
     return false;
@@ -1593,6 +1621,57 @@ void measureSensorOffsets(void) {
   Serial.print(" Deg/Sec  Z: ");
   Serial.print(gyroOffsetErrors[2]);
   Serial.println(" Deg/Sec");
+#endif
+}
+
+//======================= loadSettings ============================
+// Loads the settings from the settings file on the SD card. If the
+// settings file cannot be opened then default values are loaded.
+// Parameters:
+//  filename:  The name of the settings file
+//  newSettings:  The settings struct where the settings are saved
+// Return: None
+//=================================================================
+void loadSettings(const char* filename, Settings& newSettings) {
+  // Open the file for reading
+  File file = SD.open(filename);
+
+  // Allocate a temporary JSON document
+  JsonDocument doc;
+
+  // Deserialize the JSON document
+  DeserializationError error = deserializeJson(doc, file);
+  if (error) {
+#ifdef DEBUG
+    Serial.println("Failed to read file, using default settings");
+#endif
+  }
+
+  // Copy settings from the JsonDocument to the settings struct
+  newSettings.bat1VoltFull = doc["bat1VoltFull"] | 4.1;
+  newSettings.bat1VoltLow = doc["bat1VoltLow"] | 3.5;
+  newSettings.bat1VoltOK = doc["bat1VoltOK"] | 3.7;
+  newSettings.bat2Present = doc["bat2Present"] | false;
+  newSettings.bat2VoltFull = doc["bat2VoltFull"] | 8.2;
+  newSettings.bat2VoltLow = doc["bat2VoltLow"] | 7.0;
+  newSettings.bat2VoltOK = doc["bat2VoltOK"] | 7.4;
+  newSettings.drogueParachute = doc["drogueParachute"] | 0;
+  newSettings.parachute = doc["parachute"] | 1;
+  newSettings.secondStage = doc["secondStage"] | 0;
+  newSettings.firstStateIgnition = doc["firstStageIgnition"] | 0;
+  newSettings.flightTimeout = doc["flightTimeout"] | 30;
+  newSettings.landedThreshold = doc["landedThreshold"] | 2.0;
+  newSettings.launchAccelThreshold = doc["launchAccelThreshold"] | 0.2;
+  newSettings.logFileDuration = doc["logFileDuration"] | 0;
+  newSettings.seaLevelPressure = doc["seaLevelPressure"] | 1013.25;
+  newSettings.upGoVAddr = doc["upGoVAddr"] | 2;
+  newSettings.groundTest = doc["groundTest"] | false;
+
+  // Close the file
+  file.close();
+
+#ifdef DEBUG
+  Serial.println("Settings loaded");
 #endif
 }
 

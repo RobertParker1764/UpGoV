@@ -1,0 +1,20 @@
+{
+	"bat1VoltFull" : 4.1,
+	"bat1VoltLow" : 3.5,
+	"bat1VoltOK" : 3.7,
+	"bat2Present" : false,
+	"bat2VoltFull" : 8.2,
+	"bat2VoltLow" : 7.0,
+	"bat2VoltOK" : 7.4,
+	"drogueParachute" : 0,
+	"parachute" : 1,
+	"secondStage" : 0,
+	"firstStageIgnition" : 0,
+	"flightTimeout" : 30,
+	"landedThreshold" : 2.0,
+	"launchAccelThreshold" : 0.2,
+	"logFileDuration" : 0,
+	"seaLevelPressure" : 1013.25,
+	"upGoVAddr" : 2,
+	"groundTest" : true
+}
