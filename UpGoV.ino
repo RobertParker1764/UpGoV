@@ -1,7 +1,7 @@
 // UpGoer5Instrumentation (Green)
-// Version: Beta 7.5
+// Version: Beta 7.51
 // Author: Bob Parker
-// Date: 03/02/2024
+// Date: 03/05/2024
 //
 // Code for a model rocket instrumentation package. Measures and logs acceleration and turning
 // rates along three axis. Measures and logs atmospheric pressure and computed altitude above
@@ -145,8 +145,11 @@ struct Settings {
   double bat2VoltOK;            // 7.4V LiPo battery voltage threshold for medium charge
   double bat2VoltFull;          // 7.4V LiPo battery voltage threshold for full charge 
   uint8_t parachute;            // 0: function not used; 1 to 4: The event to use for this function
+  uint16_t parachuteReleaseDelay; // Delay in milliseconds from appogee to parachute release
   uint8_t drogueParachute;      // 0: function not used; 1 to 4: The event to use for this function
+  uint16_t drogueChuteReleaseDelay; // Delay in milliseconds from parachute release to drogue chute release
   uint8_t secondStage;          // 0: function not used; 1 to 4: The event to use for this function
+  uint16_t secondStageIgnitionDelay;  // Delay in milliseconds from first stage burnout to second stage ignition
   uint8_t firstStateIgnition;   // 0: function not used; 1 to 4: The event to use for this function
   double seaLevelPressure;      // Atmospheric pressure at sea level
   int logFileDuration;          // Data logging duration if landing is not detected
@@ -186,7 +189,6 @@ double maxAltitude = 0.0;                       // The maximum altitude measured
 uint32_t flightLength = 0;                      // The flight duration (launch to landing) in seconds
 double velocity = 0.0;                          // The computed velocity
 double maxVelocity = 0.0;                       // The maximum computed velocity during flight
-double avgEarthAccel = 1.0;                     // Average measured earth acceleration in Gs
 uint32_t prevTime = 0;                          // Previous time measurement used by velocityCalculator() ms
 double prevAcc = 0.0;                           // Previous acceleration measurement used by velocityCalculator() ft/sec2
 double prevVelocity = 0.0;                      // Previous calculated velocity used by velocityCalculator() ft/sec
@@ -517,6 +519,7 @@ void setup() {
   // Configure accelerometer settings
   accelHighG.setRange(H3LIS331DL_200g);
   accelHighG.setOutputDataRate(H3LIS331DL_ODR_100Hz);
+  accelHighG.enableAxis(H3LIS331_X);
 
   logActivity("STATUS", "H3LIS331 accelerometer sensor initialized");
 
@@ -785,9 +788,6 @@ void goToArmState() {
 //      of sensor readings before transitioning to the logging state.
 // ==========================================================================
 void armedStateLoop() {
-  // Compute a running average of the measured earth acceleration
-  // from the last 5 x-axis acceleration measurements
-  computeAverageAcceleration();
 
   // Read GPS NMEA sentences and update GPS data values
   checkGPS();
@@ -890,7 +890,7 @@ void loggingStateLoop() {
     X_AxisAcceleration = accelerometer_gyro.getXAxisAccel();
   }
 
-  velocity = velocityCalculator(timeInMS, X_AxisAcceleration - avgEarthAccel);
+  velocity = velocityCalculator(timeInMS, X_AxisAcceleration - accelOffsetErrors[0]);
 
   // Update the maximum velocity
   if (velocity > maxVelocity) {
@@ -1272,7 +1272,7 @@ bool isLaunched() {
   // Read the accelerometer/gyro sensor data
   accelerometer_gyro.readAccelData();
   // Check if acceleration measurement exceeds launch threshold
-  if ((accelerometer_gyro.getXAxisAccel() - avgEarthAccel) > settings.launchAccelThreshold) {
+  if ((accelerometer_gyro.getXAxisAccel() - accelOffsetErrors[0]) > settings.launchAccelThreshold) {
 
     return true;
 
@@ -1310,6 +1310,11 @@ void postFlightDataLog(const char* flightEndCause) {
 
 // ==================== velocityCalculator =========================
 // Calculates the rocket's velocity.
+// Parameters:
+//  currentTime - Current time in milliseconds
+//  currentAcc -  Current acceleration in Gs
+//  Return
+//    The computed velocity in ft/sec
 // ====================================================================
 double velocityCalculator(uint32_t currentTime, double currentAcc) {
 
@@ -1337,40 +1342,6 @@ double velocityCalculator(uint32_t currentTime, double currentAcc) {
   prevVelocity = velocity;
 
   return velocity;
-}
-
-// ==================== computeAverageAcceleration ===================
-// Calculates the running average of the measured acceleration over
-// 10 samples. Used to compute the average earth acceleration prior to
-// launch.
-// ===================================================================
-void computeAverageAcceleration() {
-  // Array to hold the ten acceleration measurements
-  static double accelMeasurements[10] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
-  static int accelMeasIndex = 0;  // Next measurement to be saved
-
-  if (accelMeasIndex < 10) {
-    // Read the accelerometer/gyro sensor data...
-    accelerometer_gyro.readSensorData();
-    // ... and save the latest measurement
-    accelMeasurements[accelMeasIndex] = accelerometer_gyro.getXAxisAccel();
-
-    ++accelMeasIndex;
-
-    // Compute the average acceleration
-    double accelSum = 0;
-    for (int index = 0; index < 10; ++index) {
-      accelSum += accelMeasurements[index];
-    }
-
-    // Save the result to the global variable
-    avgEarthAccel = accelSum / 10.0;
-
-#ifdef DEBUG
-    Serial.print("Average Earth Accel: ");
-    Serial.println(avgEarthAccel);
-#endif
-  }
 }
 
 // ======================== checkGPS =================================
@@ -1571,6 +1542,7 @@ void measureSensorOffsets(void) {
   // Measure the H3LIS331 Accelerometer X-Axis offset
   for (uint8_t index = 0; index < 10; index++) {
     while (!accelHighG.isDataReady()) { ; }  // Hang here until data is ready
+    accelHighG.getAcceleration();
     sensorReadingsXSum += accelHighG.getX_Accel();
   }
   highG_AccelOffsetError = sensorReadingsXSum / 10;
@@ -1666,6 +1638,9 @@ void loadSettings(const char* filename, Settings& newSettings) {
   newSettings.seaLevelPressure = doc["seaLevelPressure"] | 1013.25;
   newSettings.upGoVAddr = doc["upGoVAddr"] | 2;
   newSettings.groundTest = doc["groundTest"] | false;
+  newSettings.parachuteReleaseDelay = doc["parachuteReleaseDelay"] | 0;
+  newSettings.drogueChuteReleaseDelay = doc["drogueChuteReleaseDelay"] | 0;
+  newSettings.secondStageIgnitionDelay = doc["secondStageIgnitionDelay"] | 0;
 
   // Close the file
   file.close();
