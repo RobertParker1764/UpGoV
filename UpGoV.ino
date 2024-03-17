@@ -1,7 +1,7 @@
 // UpGoer5Instrumentation (Green)
-// Version: Beta 7.51
+// Version: Beta 8.0
 // Author: Bob Parker
-// Date: 03/05/2024
+// Date: 03/17/2024
 //
 // Code for a model rocket instrumentation package. Measures and logs acceleration and turning
 // rates along three axis. Measures and logs atmospheric pressure and computed altitude above
@@ -58,6 +58,8 @@
 // Beta 7.5: Added support for a JSON settings file on the SD card that is used to control several app
 //           settings at startup.
 
+// Beta 8.0: Ready for flight testing
+
 // ==============================  Include Files  ==================================
 #include <SPI.h>                 // Sensor and micro SD card communication
 #include <SD.h>                  // SD card library functions
@@ -70,7 +72,8 @@
 #include <RHReliableDatagram.h>  // Radio Head manager class for reliable comms
 #include <H3LIS331.hpp>          // H3LIS331 sensor library code
 #include <Arduino.h>
-#include <ArduinoJson.h>         // JASON file support for app settings
+#include <ArduinoJson.h>  // JASON file support for app settings
+#include <lowPassFilter.h>
 
 // ===============================  Constants  =====================================
 #define DEBUG  // Uncomment to enable debug comments printed to the console
@@ -79,7 +82,7 @@
 #define GPSSerial Serial1
 #define GPSECHO false
 
-const char* VERSION = "Beta 7.5";
+const char* VERSION = "Beta 8.0";
 
 // Feather M0 pin assignments
 const uint8_t BMP390_CS = 5;         // PA15
@@ -102,19 +105,19 @@ const uint8_t EVENT_3 = A2;          // PB09
 const uint8_t EVENT_4 = A1;          // PB08
 
 // Other Global Constants
-const uint8_t TC5_INT_PERIOD = 10;          // RTC interrupt period (ms)
-const uint16_t LED_PP_FAULT = 100;          // LED pulse period while in FAULT state (ms)
-const uint16_t LED_PP_ARMED = 200;          // LED pulse period while in ARMED state (ms)
-const uint16_t LED_PP_POST_FLIGHT = 10000;  // LED pulse period in POST_FLIGHT state (ms)
-const uint8_t LED_PULSE_WIDTH = 50;         // LED pulse width in all states (ms)
-const double METERS_TO_FEET = 3.28084;      // Conversion from meters to feet
-const uint16_t BAT_MEAS_PER = 30000;        // LiPo battery voltage measurement frequency (ms)
-const uint16_t EVENT_SIG_DURATION = 2000;   // Duration of event signal pulse in milliseconds
-const double GRAVITY_ACC = 32.174;          // The acceleration on the surface of the Earth in f/sec2
-const float RF95_FREQ = 915.0;              // LoRa radio frequency (MHz)
-const uint8_t MAX_MESSAGE_LENGTH = 20;      // Maximum LoRa radio message length
-const uint8_t UPGOV_ADDR = 2;               // Radio address for UpGoV avionics package
-const uint8_t GROUND_STATION_ADDR = 1;      // Radio address for the Ground Station
+const uint8_t TC5_INT_PERIOD = 10;              // RTC interrupt period (ms)
+const uint16_t LED_PP_FAULT = 100;              // LED pulse period while in FAULT state (ms)
+const uint16_t LED_PP_ARMED = 200;              // LED pulse period while in ARMED state (ms)
+const uint16_t LED_PP_POST_FLIGHT = 10000;      // LED pulse period in POST_FLIGHT state (ms)
+const uint8_t LED_PULSE_WIDTH = 50;             // LED pulse width in all states (ms)
+const double METERS_TO_FEET = 3.28084;          // Conversion from meters to feet
+const uint16_t BAT_MEAS_PER = 30000;            // LiPo battery voltage measurement frequency (ms)
+const uint16_t EVENT_SIG_DURATION = 2000;       // Duration of event signal pulse in milliseconds
+const double GRAVITY_ACC = 32.174;              // The acceleration on the surface of the Earth in f/sec2
+const float RF95_FREQ = 915.0;                  // LoRa radio frequency (MHz)
+const uint8_t MAX_MESSAGE_LENGTH = 20;          // Maximum LoRa radio message length
+const uint8_t UPGOV_ADDR = 2;                   // Radio address for UpGoV avionics package
+const uint8_t GROUND_STATION_ADDR = 1;          // Radio address for the Ground Station
 const char* settingsFileName = "Settings.txt";  // Name of the settings file on the SD card
 
 
@@ -132,32 +135,31 @@ enum errors { NONE,
               GYRO,
               ACCEL,
               ALT,
-              BATTERY 
+              BATTERY
 };
 
 // Struct to hold the app parameters that are set via the SD card settings file
 struct Settings {
-  double bat1VoltLow;           // 3.7v LiPo battery voltage threshold for low charge
-  double bat1VoltOK;            // 3.7V LiPo battery voltage threshold for medium charge
-  double bat1VoltFull;          // 3.7V LiPo battery voltage threshold for full charge
-  bool bat2Present;             // True: External event battery installed
-  double bat2VoltLow;           // 7.4V LiPo battery voltage threshold for low charge
-  double bat2VoltOK;            // 7.4V LiPo battery voltage threshold for medium charge
-  double bat2VoltFull;          // 7.4V LiPo battery voltage threshold for full charge 
-  uint8_t parachute;            // 0: function not used; 1 to 4: The event to use for this function
-  uint16_t parachuteReleaseDelay; // Delay in milliseconds from appogee to parachute release
-  uint8_t drogueParachute;      // 0: function not used; 1 to 4: The event to use for this function
-  uint16_t drogueChuteReleaseDelay; // Delay in milliseconds from parachute release to drogue chute release
-  uint8_t secondStage;          // 0: function not used; 1 to 4: The event to use for this function
+  double bat1VoltLow;                 // 3.7v LiPo battery voltage threshold for low charge
+  double bat1VoltOK;                  // 3.7V LiPo battery voltage threshold for medium charge
+  double bat1VoltFull;                // 3.7V LiPo battery voltage threshold for full charge
+  bool bat2Present;                   // True: External event battery installed
+  double bat2VoltLow;                 // 7.4V LiPo battery voltage threshold for low charge
+  double bat2VoltOK;                  // 7.4V LiPo battery voltage threshold for medium charge
+  double bat2VoltFull;                // 7.4V LiPo battery voltage threshold for full charge
+  uint8_t parachute;                  // 0: function not used; 1 to 4: The event to use for this function
+  uint16_t parachuteReleaseDelay;     // Delay in milliseconds from appogee to parachute release
+  uint8_t drogueParachute;            // 0: function not used; 1 to 4: The event to use for this function
+  uint16_t drogueChuteReleaseDelay;   // Delay in milliseconds from parachute release to drogue chute release
+  uint8_t secondStage;                // 0: function not used; 1 to 4: The event to use for this function
   uint16_t secondStageIgnitionDelay;  // Delay in milliseconds from first stage burnout to second stage ignition
-  uint8_t firstStateIgnition;   // 0: function not used; 1 to 4: The event to use for this function
-  double seaLevelPressure;      // Atmospheric pressure at sea level
-  int logFileDuration;          // Data logging duration if landing is not detected
-  double launchAccelThreshold;  // Acceleration level above which a launch will be detected
-  double landedThreshold;       // Axial rotation rate below which a landing will be detected
-  int flightTimeout;            // Time after which we will assume we have landed if landing has not been detected (seconds).
-  uint8_t upGoVAddr;            // LoRa radio address of this UpGoV avionics instance
-  bool  groundTest;             // True: Ground test mode activated.
+  uint8_t firstStateIgnition;         // 0: function not used; 1 to 4: The event to use for this function
+  double seaLevelPressure;            // Atmospheric pressure at sea level
+  double launchAccelThreshold;        // Acceleration level above which a launch will be detected
+  double landedThreshold;             // Axial rotation rate below which a landing will be detected
+  int flightTimeout;                  // Time after which we will assume we have landed if landing has not been detected (seconds).
+  uint8_t upGoVAddr;                  // LoRa radio address of this UpGoV avionics instance
+  bool groundTest;                    // True: Ground test mode activated.
 };
 
 // ===================================  Global Objects  ===================================================
@@ -167,11 +169,14 @@ BMP3XX altimeter;                                                            // 
 LSM6DSO32 accelerometer_gyro;                                                // Accelerometer/Gyro sensor object instance
 H3LIS331 accelHighG;                                                         // H3LIS331 high accelerometer object instance
 RH_RF95 radioDriver(RADIO_SPI_CS, RADIO_SPI_IRQ);                            // LoRa radio driver object
-RHReliableDatagram radioManager(radioDriver);                    // LoRa radio manager object
+RHReliableDatagram radioManager(radioDriver);                                // LoRa radio manager object
 Adafruit_GPS gps(&GPSSerial);                                                // GPS object
 File dataFile;                                                               // Data file object
 File logFile;                                                                // Log file object
 Settings settings;                                                           // Application settings
+LowPassFilter xAxisAccel;                                                    // Filter for x-axis acceleration reading
+LowPassFilter altitudeFilter;                                                // Filter for altitude reading
+LowPassFilter xAxisHighGAccel;                                               // Filter for the high G accelerometer
 
 // ================================ Global Variables ======================================================
 
@@ -202,6 +207,13 @@ int radioError = 0;                             // The number of radio messages 
 float accelOffsetErrors[] = { 0.0, 0.0, 0.0 };  // Accelerometer zero offset errors
 float gyroOffsetErrors[] = { 0.0, 0.0, 0.0 };   // Gyro zero offset erros
 float highG_AccelOffsetError = 0.0;             // X Axis offset error for the high G Accel
+uint32_t apogeeTime = 0;
+uint32_t drogueChuteReleaseTime = 0;
+uint32_t parachuteReleaseTime = 0;
+uint32_t firstStageEngineBurnoutTime = 0;
+uint32_t secondStageIgnitionTime = 0;
+bool landed = false;
+uint32_t landingTime = 0;
 
 
 // =======================  TC5 Interrupt Handler  ===================================
@@ -251,6 +263,11 @@ void setup() {
   pinMode(RFM95_RST, OUTPUT);
   digitalWrite(RFM95_RST, HIGH);
   delay(20);
+
+  // ============================ Filter initialization ==============================
+  xAxisAccel.init(25, 0.01);
+  altitudeFilter.init(10, 0.01);
+  xAxisHighGAccel.init(25, 0.01);
 
   // ========================== LoRa Radio Initialization ============================
   // Reset the LoRa radio
@@ -709,27 +726,48 @@ void readyStateLoop() {
   counter++;
   if (counter >= (BAT_MEAS_PER / TC5_INT_PERIOD)) {
     counter = 0;  // Reset the counter
-    double bat1Voltage = readBatteryVoltage();
+    double batVoltage = readBattery1Voltage();
 
     // Log the battery reading in the event log
     char logString[35];
     char buffer[5];
-    dtostrf(bat1Voltage, 2, buffer);
-    sprintf(logString, "Battery voltage = %s volts", buffer);
+    dtostrf(batVoltage, 2, buffer);
+    sprintf(logString, "Battery 1 voltage = %s volts", buffer);
     logActivity("BATTERY", logString);
 #ifdef DEBUG
-    Serial.print("Battery Voltage: ");
-    Serial.println(bat1Voltage);
+    Serial.print("Battery 1 Voltage: ");
+    Serial.println(batVoltage);
 #endif
 
-    displayBatteryLevel(bat1Voltage);
-
     // Check if the battery voltage is low. Go to FAULT state if it is
-    if (bat1Voltage < settings.bat1VoltLow) {
+    if (batVoltage < settings.bat1VoltLow) {
       state = FAULT;
-      logActivity("ERROR", "Battery voltage low");
-      sendRadioMessage("MS:Battery Low", GROUND_STATION_ADDR);
+      logActivity("ERROR", "Battery 1 voltage low");
+      sendRadioMessage("MS:Battery 1 Low", GROUND_STATION_ADDR);
       sendRadioMessage("ST:ERROR", GROUND_STATION_ADDR);
+    }
+
+    // Send battery 1 charge status to ground station for display
+    displayBatteryLevel(batVoltage, 1);
+
+    if (settings.bat2Present) {
+      batVoltage = readBattery2Voltage();
+      dtostrf(batVoltage, 2, buffer);
+      sprintf(logString, "Battery 2 voltage = %s volts", buffer);
+      logActivity("Battery", logString);
+#ifdef DEBUG
+      Serial.print("Battery 2 voltage: ");
+      Serial.println(batVoltage);
+#endif
+      // Check if the battery voltage is low. Go to fault state if it is
+      if (batVoltage < settings.bat2VoltLow) {
+        state = FAULT;
+        logActivity("ERROR", "Battery 2 voltage low");
+        sendRadioMessage("MS:Battery 2 Low", GROUND_STATION_ADDR);
+        sendRadioMessage("ST:ERROR", GROUND_STATION_ADDR);
+      }
+      // Send battery 2 charge status to ground station for display
+      displayBatteryLevel(batVoltage, 2);
     }
   }
 }
@@ -771,7 +809,7 @@ void goToArmState() {
     Serial.println("Error reading altimeter while arming");
 #endif
   }
-  logActivity("Event", "Armed");
+  logActivity("EVENT", "Armed");
 #ifdef DEBUG
   Serial.println("Arm command received and acknowledged");
 #endif
@@ -788,9 +826,20 @@ void goToArmState() {
 //      of sensor readings before transitioning to the logging state.
 // ==========================================================================
 void armedStateLoop() {
-
   // Read GPS NMEA sentences and update GPS data values
   checkGPS();
+
+  // Read and filter the altimeter data
+  readAltimeterData();
+  altitudeFilter.update(altitude - baroAltitudeError);
+
+  // Read and filter the accelerometer/gyro data (only filter the x-axis accel data)
+  accelerometer_gyro.readSensorData();
+  xAxisAccel.update(accelerometer_gyro.getXAxisAccel() - accelOffsetErrors[0]);
+
+  // Read and filter the high G accelerometer (Only filter the x-axis data)
+  accelHighG.getAcceleration();
+  xAxisHighGAccel.update(accelHighG.getX_Accel() - highG_AccelOffsetError);
 
   // Check for a DISARM event every time through the loop
   if (checkRadioMessage("disarm", GROUND_STATION_ADDR)) {
@@ -801,40 +850,35 @@ void armedStateLoop() {
     digitalWrite(LED, LOW);
   }
 
-  // Check for launch by reading the accelerometer
+  // Check for launch
   if (isLaunched()) {
     // We are launched
     // Take the first sensor readings
     launchTime = millis();
-
-    readAltimeterData();
-    accelerometer_gyro.readSensorData();
     logData(launchTime);
 
     // Transistion to Data Logging state
-    state = LOGGING;
+    state = GOTO_LOGGING;
     digitalWrite(LED, LOW);  // Make sure the on-board LED is off
     logActivity("EVENT", "Launch");
     sendRadioMessage("ST:LAUNCHED", GROUND_STATION_ADDR);
     return;
   }
 
-
   // Flash LED
   flashLED(LED_PP_ARMED);
 }
 
+// =============================== goToLoggingState =============================
+// This is a transitory state. One time processing that is necessary before
+// making the transition to the Logging State is done here.
+//  No tasks a defined
+// ==========================================================================
 void goToLoggingState() {
   state = LOGGING;
 }
 
 // ============================= Logging State Loop =========================
-// Data logging will progress in two different modes depending upon the value
-// of setting.logFileDuration. If settings.logFileDuration is equal to 0 then
-// data logging continues until the model rocket has landed as determined by
-// the angular rate readings. If settings.logFileDuration is not equal to 0 then
-// the logging continues only for the number of seconds specified by
-// settings.logFileDuration or until the model rocket lands.
 // In the logging state the following activities occur
 //   1. Measure 3-axis acceleration
 //   2. Measure 3-axis angular rates
@@ -845,9 +889,9 @@ void goToLoggingState() {
 // ==========================================================================
 void loggingStateLoop() {
   static uint16_t timeOutCounter = 0;
-  static uint8_t apogeeDetectedCounter = 0;
-  static uint16_t parachute_signal_timer = 0;
-  static bool parachute_released = false;
+  static bool drogueChuteReleaseDone = false;
+  static bool parachuteReleaseDone = false;
+  static bool secondStageIgnitionDone = false;
   timeOutCounter++;
 
 #ifdef DEBUG
@@ -858,39 +902,39 @@ void loggingStateLoop() {
   // Read the current time
   uint32_t timeInMS = millis();
 
-  // Read the altimeter data and correct altitude
+  // Read and filter the altimeter data
   readAltimeterData();
-  altitude = altitude - baroAltitudeError;
+  altitudeFilter.update(altitude - baroAltitudeError);
 
   // Update the maximum achieved altitude
-  if (altitude > maxAltitude) {
-    maxAltitude = altitude;
+  if (altitudeFilter.getCurrentFilteredValue() > maxAltitude) {
+    maxAltitude = altitudeFilter.getCurrentFilteredValue();
   }
 
-  // Check if we are at the apogee and release the parachute if we are
-  if (atApogee()) {
-    apogeeDetectedCounter++;
-    if (apogeeDetectedCounter >= 5) {
-      digitalWrite(EVENT_1, HIGH);
-      parachute_released = true;
-      apogeeDetectedCounter = 0;
+  // Check if we are at the apogee.
+  if (apogeeTime == 0) {
+    if (atApogee()) {
+      // Save the time when apogee was detected
+      apogeeTime =  millis();
     }
   }
 
   // Read the accelerometer/gyro sensor and high G accelerometer sensor data
   accelerometer_gyro.readSensorData();
+  xAxisAccel.update(accelerometer_gyro.getXAxisAccel());
   accelHighG.getAcceleration();
+  xAxisHighGAccel.update(accelHighG.getX_Accel());
 
   // Compute velocity. Use the high G accelerometer acceleration reading if the
   // LSM6DSO32 sensor acceleration reading is greater than 30g
   float X_AxisAcceleration;
-  if (accelerometer_gyro.getXAxisAccel() > 30.0) {
-    X_AxisAcceleration = accelHighG.getX_Accel();
+  if (xAxisAccel.getCurrentFilteredValue() > 30.0) {
+    X_AxisAcceleration = xAxisHighGAccel.getCurrentFilteredValue();
   } else {
-    X_AxisAcceleration = accelerometer_gyro.getXAxisAccel();
+    X_AxisAcceleration = xAxisAccel.getCurrentFilteredValue();
   }
 
-  velocity = velocityCalculator(timeInMS, X_AxisAcceleration - accelOffsetErrors[0]);
+  velocity = velocityCalculator(timeInMS, X_AxisAcceleration);
 
   // Update the maximum velocity
   if (velocity > maxVelocity) {
@@ -902,35 +946,89 @@ void loggingStateLoop() {
     maxAcceleration = X_AxisAcceleration;
   }
 
+  //Log the data
+  logData(timeInMS);
 
-  if ((settings.logFileDuration == 0) || ((timeInMS - launchTime) <= (settings.logFileDuration * 1000))) {
+  // Check for first stage engine burnout
+  if (firstStageBurnout()) {
+    firstStageEngineBurnoutTime = millis();
+  }
 
-    //Log the data
-    logData(timeInMS);
+  // Second stage engine ignition sequence
+  if (settings.secondStage && firstStageEngineBurnoutTime != 0) {
+    if (millis() - firstStageEngineBurnoutTime >= settings.secondStageIgnitionDelay) {
+      secondStageIgnitionTime = millis();
+      fireSecondStageInitiator(HIGH);
+    }
+  }
+
+  // Check if second stage ignition signal needs to be turned off
+  if (secondStageIgnitionTime != 0 && !secondStageIgnitionDone) {
+    if (millis() - secondStageIgnitionTime >= EVENT_SIG_DURATION) {
+      fireSecondStageInitiator(LOW);
+      secondStageIgnitionDone = true;
+    }
+  }
+
+  // Parachute release event sequence
+  if (apogeeTime != 0) {
+    // Handle drogue chute release
+    if (settings.drogueParachute && drogueChuteReleaseTime == 0) {
+      if (millis() - apogeeTime >= settings.drogueChuteReleaseDelay) {
+        // Fire the drogue chute initiator
+        drogueChuteReleaseTime = millis();
+        fireDrogueChuteInitiator(HIGH);
+      }
+    }
+    // Handle parachute release
+    if (settings.parachute && parachuteReleaseTime == 0) {
+      if (settings.drogueParachute) {
+        if (drogueChuteReleaseTime != 0) {
+          if (millis() - drogueChuteReleaseTime >= settings.parachuteReleaseDelay) {
+            // Fire the parachute initiator
+            parachuteReleaseTime = millis();
+            fireParachuteInitiator(HIGH);
+          }
+        }
+      } else {
+        if (millis() - apogeeTime >= settings.parachuteReleaseDelay) {
+          // Fire the parachute initiator
+          parachuteReleaseTime = millis();
+          fireParachuteInitiator(HIGH);
+        }
+      }
+    }
+  }
+
+  // Check if the parachute release signals need to be turned off
+  if (drogueChuteReleaseTime != 0 && !drogueChuteReleaseDone) {
+    if (millis() - drogueChuteReleaseTime >= EVENT_SIG_DURATION) {
+      fireDrogueChuteInitiator(LOW);
+      drogueChuteReleaseDone = true;
+    }
+  }
+
+  if (parachuteReleaseTime != 0 && !parachuteReleaseDone) {
+    if (millis() - parachuteReleaseTime >= EVENT_SIG_DURATION) {
+      fireParachuteInitiator(LOW);
+      parachuteReleaseDone = true;
+    }
   }
 
   // Check if we have landed (no more motion)
   if (isLanded()) {
-    state = POST_FLIGHT;
-    postFlightDataLog("LANDED");
-    sendRadioMessage("ST:LANDED", GROUND_STATION_ADDR);
+    state = GOTO_POST_FLIGHT;
+    landed = true;
+    landingTime = millis();
     closeDataFile();
   }
 
 
   // Check for timeout
   if (timeOutCounter * TC5_INT_PERIOD > settings.flightTimeout * 1000) {
-    state = POST_FLIGHT;
-    postFlightDataLog("TIMEOUT");
-    sendRadioMessage("ST:LANDED", GROUND_STATION_ADDR);
-    timeOutCounter = 0;
+    state = GOTO_POST_FLIGHT;
+    landingTime = millis();
     closeDataFile();
-  }
-
-  // Checks if we need to turn off the parachute release signal
-  parachute_signal_timer++;
-  if (parachute_signal_timer >= (EVENT_SIG_DURATION / TC5_INT_PERIOD)) {
-    digitalWrite(EVENT_1, LOW);
   }
 
 #ifdef DEBUG
@@ -939,7 +1037,40 @@ void loggingStateLoop() {
 #endif
 }
 
+// =============================== goToPostFlightState =============================
+// This is a transitory state. One time processing that is necessary before
+// making the transition to the PostFlight State is done here.
+//  1. Log flight events and data to the SD card
+//  2. Send the post flight radio messages
+// ==========================================================================
 void goToPostFlightState() {
+  // Log flight events / data
+  if (landed) {
+    postFlightDataLog("Landed");
+  } else {
+    postFlightDataLog("Timeout");
+  }
+
+  // Send post flight radio messages
+  sendRadioMessage("ST:LANDED", GROUND_STATION_ADDR);
+  delay(20);
+
+  char valueBuffer[6];
+  char logStringBuffer[15];
+
+  sprintf(logStringBuffer, "AL: %u", (uint32_t)maxAltitude);
+  sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
+  delay(20);
+
+  dtostrf(maxAcceleration, 2, valueBuffer);
+  sprintf(logStringBuffer, "AC:%s", valueBuffer);
+  sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
+  delay(20);
+
+  sprintf(logStringBuffer, "DU:%u", flightLength);
+  sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
+  delay(20);
+
   state = POST_FLIGHT;
 }
 
@@ -950,58 +1081,8 @@ void goToPostFlightState() {
 // The application cannot exit the post flight state.
 // ==========================================================================
 void postFlightStateLoop() {
-  static bool sent = false;
-  static bool connected = false;
 
   flashLED(LED_PP_POST_FLIGHT);
-
-  // Check for an incoming "connect" radio message
-  if (checkRadioMessage("connect", GROUND_STATION_ADDR)) {
-    sendRadioMessage("connect", GROUND_STATION_ADDR);
-    connected = true;
-  }
-
-  if (connected && !sent) {
-    delay(5000);
-
-    char valueBuffer[2];
-    char logStringBuffer[15];
-
-    sprintf(logStringBuffer, "AL: %u", (uint32_t)maxAltitude);
-    sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
-    delay(20);
-
-    dtostrf(maxAcceleration, 2, valueBuffer);
-    sprintf(logStringBuffer, "AC:%s", valueBuffer);
-    sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
-    delay(20);
-
-    sprintf(logStringBuffer, "DU:%u", flightLength);
-    sendRadioMessage(logStringBuffer, GROUND_STATION_ADDR);
-    delay(20);
-
-    sendRadioMessage("AT:AGAIN", GROUND_STATION_ADDR);
-    delay(20);
-
-
-    sent = true;
-  }
-
-  // Check for the "again" message
-  if (checkRadioMessage("again", GROUND_STATION_ADDR)) {
-    state = READY;
-    maxAltitude = 0;
-    maxAcceleration = 0;
-    maxVelocity = 0;
-    flightLength = 0;
-    prevTime = 0;
-    prevAcc = 0.0;  // f/sec2
-    prevVelocity = 0;
-    logActivity("EVENT", "READY");
-    sent = false;
-    connected = false;
-    sendRadioMessage("ST:READY", GROUND_STATION_ADDR);
-  }
 }
 
 
@@ -1168,27 +1249,46 @@ void closeDataFile() {
   }
 }
 
-// ======================== readBatteryVoltage ==============================
+// ======================== readBattery1Voltage ==============================
 // Reads and returns the LiPo battery voltage. The value returned is in volts
 // ==========================================================================
-double readBatteryVoltage(void) {
+double readBattery1Voltage(void) {
   int batteryVolt = analogRead(BAT_1_MONITOR);
   return ((batteryVolt * 4.096) / 4096.0);  // measurement in volts
 }
 
-// ======================= displayBatteryLevel ==============================
-// Sends the current battery voltage reading to the connected bluetooth
-// device.
+// ======================== readBattery2Voltage ==============================
+// Reads and returns the LiPo battery voltage. The value returned is in volts
 // ==========================================================================
-void displayBatteryLevel(double batteryVoltage) {
-  if (batteryVoltage >= settings.bat1VoltFull) {
-    sendRadioMessage("B1:FULL", GROUND_STATION_ADDR);
-  } else if (batteryVoltage >= settings.bat1VoltOK) {
-    sendRadioMessage("B1:OK", GROUND_STATION_ADDR);
-  } else if (batteryVoltage >= settings.bat1VoltLow) {
-    sendRadioMessage("B1:LOW", GROUND_STATION_ADDR);
-  } else {
-    sendRadioMessage("B1:CRITICAL", GROUND_STATION_ADDR);
+double readBattery2Voltage(void) {
+  int batteryVolt = analogRead(BAT_2_MONITOR);
+  return ((batteryVolt * 8.806) / 4096.0);  // measurement in volts
+}
+
+// ======================= displayBatteryLevel ==============================
+// Sends the battery charge status to the ground station
+// ==========================================================================
+void displayBatteryLevel(double batteryVoltage, uint8_t batteryNum) {
+  if (batteryNum == 1) {
+    if (batteryVoltage >= settings.bat1VoltFull) {
+      sendRadioMessage("B1:FULL", GROUND_STATION_ADDR);
+    } else if (batteryVoltage >= settings.bat1VoltOK) {
+      sendRadioMessage("B1:OK", GROUND_STATION_ADDR);
+    } else if (batteryVoltage >= settings.bat1VoltLow) {
+      sendRadioMessage("B1:LOW", GROUND_STATION_ADDR);
+    } else {
+      sendRadioMessage("B1:CRITICAL", GROUND_STATION_ADDR);
+    }
+  } else if (batteryNum == 2) {
+    if (batteryVoltage >= settings.bat2VoltFull) {
+      sendRadioMessage("B2:FULL", GROUND_STATION_ADDR);
+    } else if (batteryVoltage >= settings.bat2VoltOK) {
+      sendRadioMessage("B2:OK", GROUND_STATION_ADDR);
+    } else if (batteryVoltage >= settings.bat2VoltLow) {
+      sendRadioMessage("B2:LOW", GROUND_STATION_ADDR);
+    } else {
+      sendRadioMessage("B2:CRITICAL", GROUND_STATION_ADDR);
+    }
   }
 }
 
@@ -1265,14 +1365,13 @@ void flashLED(uint16_t pulsePeriod) {
 }
 
 // ========================= isLaunched ===============================
-// Reads the accelerometer and returns true if the measurement
-// indicates a launch has occurred.
+// Checks for launch by comparing current filtered acceleration
+// reading with the launch acceleration threshold value.
 // ====================================================================
 bool isLaunched() {
-  // Read the accelerometer/gyro sensor data
-  accelerometer_gyro.readAccelData();
+
   // Check if acceleration measurement exceeds launch threshold
-  if ((accelerometer_gyro.getXAxisAccel() - accelOffsetErrors[0]) > settings.launchAccelThreshold) {
+  if (xAxisAccel.getCurrentFilteredValue() > settings.launchAccelThreshold) {
 
     return true;
 
@@ -1286,14 +1385,13 @@ bool isLaunched() {
 // duration after timeout\landing.
 // ====================================================================
 void postFlightDataLog(const char* flightEndCause) {
-  state = POST_FLIGHT;
   if (dataFileOpen) {
     closeDataFile();
   }
+
   logActivity("EVENT", flightEndCause);
   // Log the maximum acceleration and altitude
-  uint32_t landTime = millis();
-  flightLength = landTime - launchTime;
+  flightLength = landingTime - launchTime;
   flightLength /= 1000;
   char logString[40];
   char buffer[8];
@@ -1306,6 +1404,22 @@ void postFlightDataLog(const char* flightEndCause) {
   logActivity("STATUS", logString);
   sprintf(logString, "Maximum velocity = %u fps", (uint32_t)maxVelocity);
   logActivity("STATUS", logString);
+  sprintf(logString, "First stage burnout: %u ms", firstStageEngineBurnoutTime - launchTime);
+  logActivity("EVENT", logString);
+  if (settings.secondStage) {
+    sprintf(logString, "Second stage ignition: %u ms", secondStageIgnitionTime - launchTime);
+    logActivity("EVENT", logString);
+  }
+  sprintf(logString, "Apogee time: %u ms", apogeeTime - launchTime);
+  logActivity("EVENT", logString);
+  if (settings.parachute) {
+    sprintf(logString, "Parachute release: %u ms", parachuteReleaseTime - launchTime);
+    logActivity("EVENT", logString);
+  }
+  if (settings.drogueParachute) {
+    sprintf(logString, "Drogue release: %u ms", drogueChuteReleaseTime - launchTime);
+    logActivity("EVENT", logString);
+  }
 }
 
 // ==================== velocityCalculator =========================
@@ -1375,11 +1489,11 @@ void checkGPS() {
 // ===================================================================
 bool atApogee() {
   // Check for low altitude apogee
-  if ((maxAltitude < (75.0 + launchPointAlt)) && (altitude < (maxAltitude - 1))) {
+  if ((maxAltitude < (75.0 + launchPointAlt)) && (altitudeFilter.getCurrentFilteredValue() < (maxAltitude - 1))) {
     return true;
   }
   // Check for high altitude apogee
-  if ((maxAltitude >= (75.0 + launchPointAlt)) && (altitude < (maxAltitude - 10))) {
+  if ((maxAltitude >= (75.0 + launchPointAlt)) && (altitudeFilter.getCurrentFilteredValue() < (maxAltitude - 10))) {
     return true;
   }
   return false;
@@ -1634,7 +1748,6 @@ void loadSettings(const char* filename, Settings& newSettings) {
   newSettings.flightTimeout = doc["flightTimeout"] | 30;
   newSettings.landedThreshold = doc["landedThreshold"] | 2.0;
   newSettings.launchAccelThreshold = doc["launchAccelThreshold"] | 0.2;
-  newSettings.logFileDuration = doc["logFileDuration"] | 0;
   newSettings.seaLevelPressure = doc["seaLevelPressure"] | 1013.25;
   newSettings.upGoVAddr = doc["upGoVAddr"] | 2;
   newSettings.groundTest = doc["groundTest"] | false;
@@ -1648,6 +1761,146 @@ void loadSettings(const char* filename, Settings& newSettings) {
 #ifdef DEBUG
   Serial.println("Settings loaded");
 #endif
+}
+
+//================= firstStageBurnout ======================
+// Detects burnout of the first stage engine. If burnout is detected
+// then returns true.
+// Parameters: None
+// Return: True if first stage engine burnout is detected.
+//=================================================================
+bool firstStageBurnout() {
+  //TODO: Need to develop an algorithm for this function.
+  return true;
+}
+
+//================= fireSecondStageInitiator ======================
+// Turns on the digital output associated with the second stage
+// engine ignition initiator.
+// Parameters:
+//  fire: If true the digital output is turned on.
+// Return: None
+//=================================================================
+void fireSecondStageInitiator(bool fire) {
+  switch (settings.secondStage) {
+    case 1:
+      if (fire == HIGH) {
+        digitalWrite(SCL, HIGH);
+      } else {
+        digitalWrite(SCL, LOW);
+      }
+      break;
+    case 2:
+      if (fire == HIGH) {
+        digitalWrite(A3, HIGH);
+      } else {
+        digitalWrite(A3, LOW);
+      }
+      break;
+    case 3:
+      if (fire == HIGH) {
+        digitalWrite(A2, HIGH);
+      } else {
+        digitalWrite(A2, LOW);
+      }
+      break;
+    case 4:
+      if (fire == HIGH) {
+        digitalWrite(A1, HIGH);
+      } else {
+        digitalWrite(A1, LOW);
+      }
+      break;
+    default:
+      Serial.println("Error: No second stage intalled");
+      break;
+  }
+}
+
+//================= fireParachuteInitiator ======================
+// Turns on the digital output associated with the parachute
+// initiator.
+// Parameters:
+//  fire: If true the digital output is turned on.
+// Return: None
+//=================================================================
+void fireParachuteInitiator(bool fire) {
+  switch (settings.parachute) {
+    case 1:
+      if (fire == HIGH) {
+        digitalWrite(SCL, HIGH);
+      } else {
+        digitalWrite(SCL, LOW);
+      }
+      break;
+    case 2:
+      if (fire == HIGH) {
+        digitalWrite(A3, HIGH);
+      } else {
+        digitalWrite(A3, LOW);
+      }
+      break;
+    case 3:
+      if (fire == HIGH) {
+        digitalWrite(A2, HIGH);
+      } else {
+        digitalWrite(A2, LOW);
+      }
+      break;
+    case 4:
+      if (fire == HIGH) {
+        digitalWrite(A1, HIGH);
+      } else {
+        digitalWrite(A1, LOW);
+      }
+      break;
+    default:
+      Serial.println("Error: No parachute intalled");
+      break;
+  }
+}
+
+//================= fireDrogueChuteInitiator ======================
+// Turns on the digital output associated with the drogue parachute
+// initiator.
+// Parameters:
+//  fire: If true the initiator output is turned on
+// Return: None
+//=================================================================
+void fireDrogueChuteInitiator(bool fire) {
+  switch (settings.drogueParachute) {
+    case 1:
+      if (fire == HIGH) {
+        digitalWrite(SCL, HIGH);
+      } else {
+        digitalWrite(SCL, LOW);
+      }
+      break;
+    case 2:
+      if (fire == HIGH) {
+        digitalWrite(A3, HIGH);
+      } else {
+        digitalWrite(A3, LOW);
+      }
+      break;
+    case 3:
+      if (fire == HIGH) {
+        digitalWrite(A2, HIGH);
+      } else {
+        digitalWrite(A2, LOW);
+      }
+      break;
+    case 4:
+      if (fire == HIGH) {
+        digitalWrite(A1, HIGH);
+      } else {
+        digitalWrite(A1, LOW);
+      }
+      break;
+    default:
+      Serial.println("Error: No drogue chute intalled");
+      break;
+  }
 }
 
 //========================== dtostrf ==============================
